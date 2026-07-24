@@ -12,7 +12,9 @@ import * as path from "path";
 import { spawn } from "child_process";
 import { safePath, getWorkspaceRoot } from "../../context/workspaceUtils";
 import { defineTool } from "./types";
-import { STOP, walk, globToRe, rgAvailable } from "./shared";
+import { STOP, rgCommand } from "./shared";
+import { scanFilesCached, compileGlob, normalizeGlobPattern } from "./fileScan";
+import { BINARY_EXTS, isNoisePath, NOISE_GLOBS } from "./ignore";
 import { search as semanticIndexSearch, buildIndex, isIndexing, isIndexingEnabled } from "../semanticIndex";
 import { searchDocs, listDocSources } from "../docsIndex";
 
@@ -37,6 +39,18 @@ const TYPE_EXTS: Record<string, string[]> = {
   yaml: [".yaml", ".yml"],
 };
 
+/** Trim very long lines (minified bundles) so one line cannot flood the output. */
+function clip(line: string, max = 500): string {
+  return line.length > max ? line.slice(0, max) + " …[truncated]" : line;
+}
+
+/** Count newlines without allocating a split array. */
+function countLines(s: string): number {
+  let n = 0;
+  for (let i = s.indexOf("\n"); i !== -1; i = s.indexOf("\n", i + 1)) n++;
+  return n;
+}
+
 // ---- Grep (ripgrep with a node fallback) ----
 export const grepTool = defineTool("Grep", false, async (input, abortSignal) => {
   try {
@@ -56,23 +70,51 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
   const pattern = String(input.pattern ?? "");
   if (!pattern) return { output: "error: pattern is required" };
 
-  if (await rgAvailable()) {
-    const args = ["--color=never", "--hidden", "--glob", "!**/.git/**", "--glob", "!**/node_modules/**"];
+  // Validate the regex up front so a bad pattern fails fast with a clear
+  // message instead of an opaque non-zero rg exit.
+  try {
+    new RegExp(pattern);
+  } catch (e) {
+    return { output: `error: invalid pattern: ${e instanceof Error ? e.message : String(e)}` };
+  }
+
+  const rgBin = await rgCommand();
+  if (rgBin) {
+    const args = [
+      "--color=never",
+      "--hidden",
+      "--no-messages",
+      // Emit forward slashes so output matches the node fallback and the paths
+      // the model passes back to Read/StrReplace.
+      "--path-separator", "/",
+      "--glob", "!**/.git/**",
+      "--glob", "!**/node_modules/**",
+      // Bound worst-case cost on generated/vendored blobs.
+      "--max-filesize", "8M",
+      "--max-columns", "500",
+      "--max-columns-preview",
+    ];
+    // Keep both backends in agreement about what counts as searchable code.
+    for (const g of NOISE_GLOBS) args.push("--glob", `!${g}`);
     if (mode === "files_with_matches") {
       args.push("--files-with-matches");
     } else if (mode === "count") {
       args.push("--count");
     } else {
-      args.push("--line-number", "--no-heading");
-      if (input["-A"] != null) args.push("-A", String(input["-A"]));
-      if (input["-B"] != null) args.push("-B", String(input["-B"]));
-      if (input["-C"] != null) args.push("-C", String(input["-C"]));
+      args.push("--line-number", "--no-heading", "--with-filename");
+      const ctxA = input["-A"] ?? input["-C"];
+      const ctxB = input["-B"] ?? input["-C"];
+      if (ctxA != null) args.push("-A", String(Math.max(0, Math.min(Number(ctxA) || 0, 50))));
+      if (ctxB != null) args.push("-B", String(Math.max(0, Math.min(Number(ctxB) || 0, 50))));
     }
     if (input["-i"]) args.push("-i");
     if (input.multiline) args.push("-U", "--multiline-dotall");
     if (input.glob) args.push("--glob", String(input.glob));
     if (input.type) args.push("--type", String(input.type));
-    args.push("--", pattern, target);
+    // Paginated calls must see a stable order; --sort=path costs parallelism,
+    // so only pay for it when the caller is actually paging through results.
+    if (skip > 0) args.push("--sort=path");
+    args.push("--regexp", pattern, "--", target);
 
     const out = await new Promise<string>((res) => {
       let settled = false;
@@ -97,7 +139,7 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
         finish(o ? o.slice(0, 12_000) + "\n(grep timed out)" : "(grep timed out)");
       }, 15_000);
       try {
-        c = spawn("rg", args, { cwd: root, windowsHide: true });
+        c = spawn(rgBin, args, { cwd: root, windowsHide: true });
       } catch (e) {
         finish(`(grep failed: ${e instanceof Error ? e.message : String(e)})`);
         return;
@@ -107,19 +149,34 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
         return;
       }
       abortSignal?.addEventListener("abort", onAbort, { once: true });
+      let flooded = false;
       c.stdout?.on("data", (d) => {
         o += d;
-        // Bound memory if rg floods output.
-        if (o.length > 2_000_000) {
+        // Stop early once we clearly have more than the caller can consume,
+        // instead of buffering an entire repo-wide match set.
+        if (!flooded && (o.length > 4_000_000 || countLines(o) > skip + cap + 1_000)) {
+          flooded = true;
           try { c.kill("SIGTERM"); } catch { /* ignore */ }
         }
       });
-      c.stderr?.on("data", () => { /* ignore */ });
+      let stderr = "";
+      c.stderr?.on("data", (d) => { if (stderr.length < 2_000) stderr += d; });
       c.on("error", (e) => finish(`(grep failed: ${e instanceof Error ? e.message : String(e)})`));
-      c.on("close", () => {
-        let lines = o.split("\n").filter(Boolean);
-        if (skip) lines = lines.slice(skip);
-        finish(lines.slice(0, cap).join("\n") || "(no matches)");
+      c.on("close", (code) => {
+        // rg prefixes results with "./" when searching the cwd; strip it so the
+        // model gets plain workspace-relative paths it can feed back to Read.
+        const all = o.split("\n").filter(Boolean).map((l) => (l.startsWith("./") ? l.slice(2) : l));
+        // rg exits 1 for "no matches" and >1 for real errors.
+        if (!all.length && code != null && code > 1 && stderr.trim()) {
+          finish(`error: ripgrep failed: ${stderr.trim().split("\n")[0]}`);
+          return;
+        }
+        const lines = skip ? all.slice(skip) : all;
+        const shown = lines.slice(0, cap);
+        if (!shown.length) return finish("(no matches)");
+        const rest = lines.length - shown.length;
+        const note = rest > 0 || flooded ? `\n… (at least ${lines.length + (flooded ? 1 : 0)} results${flooded ? "+" : ""}, truncated — refine the pattern, glob, or use head_limit/offset)` : "";
+        finish(shown.join("\n") + note);
       });
     });
     return { output: out };
@@ -134,10 +191,6 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
       return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
     }
   }
-  const all: string[] = [];
-  await walk(scopeRoot, all, 0, false, abortSignal, 15_000);
-  if (abortSignal?.aborted) return { output: "(grep aborted)" };
-
   let lineRe: RegExp;
   let multiRe: RegExp | null = null;
   try {
@@ -147,72 +200,145 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
   } catch (e) {
     return { output: `error: invalid pattern: ${e instanceof Error ? e.message : String(e)}` };
   }
-  const globRe = input.glob
-    ? globToRe(String(input.glob).startsWith("**/") ? String(input.glob) : "**/" + String(input.glob))
-    : null;
+  const glob = input.glob ? compileGlob(normalizeGlobPattern(String(input.glob))) : null;
   const typeExts = input.type ? TYPE_EXTS[String(input.type)] : null;
-  const aCtx = Math.max(0, Number(input["-A"] ?? input["-C"] ?? 0));
-  const bCtx = Math.max(0, Number(input["-B"] ?? input["-C"] ?? 0));
+  const aCtx = Math.max(0, Math.min(Number(input["-A"] ?? input["-C"] ?? 0), 50));
+  const bCtx = Math.max(0, Math.min(Number(input["-B"] ?? input["-C"] ?? 0), 50));
+
+  const { files: scanned, truncated: scanTruncated } = await scanFilesCached(scopeRoot, {
+    signal: abortSignal,
+    maxFiles: 40_000,
+    timeMs: 10_000,
+  });
+  if (abortSignal?.aborted) return { output: "(grep aborted)" };
+
+  // Cheap metadata filters first — avoids opening files we can never match.
+  const candidates = scanned.filter((f) => {
+    const rel = path.relative(root, f.abs).split(path.sep).join("/");
+    if (glob && !glob.test(rel)) return false;
+    if (typeExts && !typeExts.includes(path.extname(f.abs).toLowerCase())) return false;
+    if (BINARY_EXTS.has(path.extname(f.abs).toLowerCase())) return false;
+    if (isNoisePath(rel)) return false;
+    if (f.size > 4_000_000 || f.size === 0) return false;
+    return true;
+  });
+  // Deterministic order so head_limit/offset paginate consistently.
+  candidates.sort((a, b) => a.rel.localeCompare(b.rel));
 
   const hitsByFile: Record<string, string[]> = {};
   const countByFile: Record<string, number> = {};
   const order: string[] = [];
-  for (const f of all.slice(0, 3000)) {
-    if (abortSignal?.aborted) return { output: "(grep aborted)" };
-    const rel = path.relative(root, f).split(path.sep).join("/");
-    if (globRe && !globRe.test(rel)) continue;
-    if (typeExts && !typeExts.includes(path.extname(f).toLowerCase())) continue;
+  let filesTruncated = candidates.length > 20_000;
+
+  // Read files concurrently; regex matching stays on the main thread but I/O
+  // no longer serializes, which was the dominant cost in the old fallback.
+  const CONCURRENCY = 16;
+  const list = candidates.slice(0, 20_000);
+  let cursor = 0;
+  let stopped = false;
+
+  const processFile = async (f: (typeof list)[number]): Promise<void> => {
+    const rel = path.relative(root, f.abs).split(path.sep).join("/");
     let txt: string;
     try {
-      const st = await fs.stat(f);
-      if (st.size > 1_000_000) continue; // skip huge files in fallback
-      txt = await fs.readFile(f, "utf8");
+      const buf = await fs.readFile(f.abs);
+      // NUL byte in the head => binary; skip like ripgrep does.
+      const probe = buf.subarray(0, Math.min(buf.length, 8192));
+      if (probe.includes(0)) return;
+      txt = buf.toString("utf8");
     } catch {
-      continue; // binary / unreadable
+      return; // unreadable
     }
-    const push = (line: string) => {
+    // Register the file as a match exactly once, regardless of output mode.
+    const mark = () => {
       if (!hitsByFile[rel]) {
         hitsByFile[rel] = [];
         order.push(rel);
         countByFile[rel] = 0;
       }
+    };
+    const push = (line: string) => {
+      mark();
       hitsByFile[rel].push(line);
     };
     if (multiRe) {
       if (multiRe.test(txt)) {
-        countByFile[rel] = (countByFile[rel] ?? 0) + 1;
-        push(`${rel}:${txt.slice(0, 500)}`);
+        mark();
+        countByFile[rel]++;
+        if (mode === "content") push(`${rel}:${clip(txt.replace(/\n/g, "\\n"))}`);
       }
-      continue;
+      return;
     }
+
+    // files_with_matches only needs to know whether ANY line matches.
+    if (mode === "files_with_matches") {
+      lineRe.lastIndex = 0;
+      if (lineRe.test(txt)) {
+        mark();
+        countByFile[rel]++;
+      }
+      return;
+    }
+
     const lines = txt.split("\n");
     for (let idx = 0; idx < lines.length; idx++) {
       const l = lines[idx];
       if (!lineRe.test(l)) continue;
-      countByFile[rel] = (countByFile[rel] ?? 0) + 1;
-      if (mode !== "content") {
-        push(`${rel}:${idx + 1}:${l}`);
-        continue;
-      }
+      mark();
+      countByFile[rel]++;
+      if (mode !== "content") continue; // count mode: tally only
       for (let b = bCtx; b >= 1; b--) {
-        if (idx - b >= 0) push(`${rel}-${idx + 1 - b}-${lines[idx - b]}`);
+        if (idx - b >= 0) push(`${rel}-${idx + 1 - b}-${clip(lines[idx - b])}`);
       }
-      push(`${rel}:${idx + 1}:${l}`);
+      push(`${rel}:${idx + 1}:${clip(l)}`);
       for (let a = 1; a <= aCtx; a++) {
-        if (idx + a < lines.length) push(`${rel}-${idx + 1 + a}-${lines[idx + a]}`);
+        if (idx + a < lines.length) push(`${rel}-${idx + 1 + a}-${clip(lines[idx + a])}`);
       }
     }
-  }
+  };
 
+  const totalHits = (): number => {
+    if (mode === "content") {
+      let n = 0;
+      for (const f of order) n += hitsByFile[f].length;
+      return n;
+    }
+    return order.length;
+  };
+
+  const worker = async (): Promise<void> => {
+    while (cursor < list.length && !stopped) {
+      if (abortSignal?.aborted) {
+        stopped = true;
+        return;
+      }
+      const f = list[cursor++];
+      await processFile(f);
+      // Enough material to satisfy the request — stop scanning the rest.
+      if (order.length > 0 && totalHits() > skip + cap + 500) {
+        stopped = true;
+        filesTruncated = true;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, list.length) }, worker));
+  if (abortSignal?.aborted) return { output: "(grep aborted)" };
+
+  order.sort((a, b) => a.localeCompare(b));
   let result: string[];
   if (mode === "files_with_matches") result = order;
   else if (mode === "count") result = order.map((f) => `${f}:${countByFile[f]}`);
   else result = order.flatMap((f) => hitsByFile[f]);
   if (skip) result = result.slice(skip);
-  const truncated = result.length > cap;
+  const truncated = result.length > cap || filesTruncated || scanTruncated;
   const shown = result.slice(0, cap);
-  if (!shown.length) return { output: "(no matches)" };
-  return { output: shown.join("\n") + (truncated ? `\n... (at least ${result.length} matches, truncated)` : "") };
+  if (!shown.length) {
+    return { output: truncated ? "(no matches in the scanned subset — search was truncated)" : "(no matches)" };
+  }
+  const note = truncated
+    ? `\n… (at least ${result.length} results, truncated — refine the pattern, glob, or use head_limit/offset)`
+    : "";
+  return { output: shown.join("\n") + note };
   } catch (e) {
     return { output: `error: Grep failed: ${e instanceof Error ? e.message : String(e)}` };
   }

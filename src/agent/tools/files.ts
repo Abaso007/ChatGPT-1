@@ -13,7 +13,8 @@ import * as path from "path";
 import { safePath, getWorkspaceRoot } from "../../context/workspaceUtils";
 import { pendingChanges } from "../../stores/pendingChanges";
 import { defineTool, type Tool, type ToolResult, type ToolContext } from "./types";
-import { IGNORE, walk, globToRe, sortByMtime, fuzzyScore, makeDiff, firstDiffLine } from "./shared";
+import { IGNORE, makeDiff, firstDiffLine } from "./shared";
+import { scanFilesCached, compileGlob, normalizeGlobPattern, scorePath } from "./fileScan";
 
 // Image extensions the Read tool returns as base64 blocks to the model.
 const IMAGE_MIME: Record<string, string> = {
@@ -298,6 +299,8 @@ export const listDirTool = defineTool("ListDir", false, async (input, abortSigna
 });
 
 // ---- Glob ----
+const GLOB_MAX_RESULTS = 200;
+
 export const globTool = defineTool("Glob", false, async (input, abortSignal) => {
 	try {
 		let root: string;
@@ -306,51 +309,82 @@ export const globTool = defineTool("Glob", false, async (input, abortSignal) => 
 		} catch (e) {
 			return { output: `error: invalid target_directory: ${e instanceof Error ? e.message : String(e)}` };
 		}
-		// Only walk ignored dirs when the pattern explicitly targets them
-		// (e.g. "**/node_modules/**") - otherwise node_modules hangs the tool.
-		let pattern: string = String(input.glob_pattern ?? "");
-		if (pattern && !pattern.startsWith("**/")) pattern = "**/" + pattern;
-		const wantsIgnored = /node_modules|\.git|[/\\]dist[/\\]|[/\\]out[/\\]|[/\\]build[/\\]/.test(pattern);
-		const all: string[] = [];
-		await walk(root, all, 0, wantsIgnored, abortSignal, 20_000);
-		if (abortSignal?.aborted) return { output: "(glob aborted)" };
-		const re = globToRe(pattern);
+		const raw = String(input.glob_pattern ?? "");
+		if (!raw.trim()) return { output: "error: glob_pattern is required" };
+		const pattern = normalizeGlobPattern(raw);
+		const g = compileGlob(pattern);
 
-		const matched = all.filter((f) => {
-			try {
-				return re.test(path.relative(root, f).split(path.sep).join("/"));
-			} catch {
-				return false;
-			}
+		// Only descend into normally-ignored trees when the pattern asks for them,
+		// otherwise node_modules alone can dominate the walk.
+		const wantsIgnored = /node_modules|dist|out|build|coverage|vendor|target|\.venv/.test(pattern);
+
+		// Literal prefix pruning: "src/agent/**/*.ts" never descends outside src/agent.
+		const prefix = g.prefix;
+		const dirFilter = prefix
+			? (rel: string) => rel === prefix || rel.startsWith(prefix + "/") || prefix.startsWith(rel + "/")
+			: undefined;
+
+		const { files, truncated } = await scanFilesCached(root, {
+			includeIgnored: wantsIgnored,
+			signal: abortSignal,
+			maxFiles: 60_000,
+			timeMs: 12_000,
+			dirFilter,
 		});
-		// Cap mtime sort work — huge match sets made Glob look stuck.
-		const toSort = matched.slice(0, 2_000);
-		const sorted = await sortByMtime(toSort);
-		const hits = sorted.slice(0, 200).map((f) => path.relative(root, f).split(path.sep).join("/"));
-		const extra = matched.length > hits.length ? `\n… (${matched.length - hits.length} more)` : "";
-		return { output: (hits.join("\n") || "(no matches)") + extra };
+		if (abortSignal?.aborted) return { output: "(glob aborted)" };
+
+		const matched = files.filter((f) => g.test(f.rel));
+		// Sort by mtime (newest first) — metadata already gathered during the scan,
+		// so this no longer costs a second stat pass over thousands of files.
+		matched.sort((a, b) => b.mtimeMs - a.mtimeMs || a.rel.localeCompare(b.rel));
+
+		const hits = matched.slice(0, GLOB_MAX_RESULTS).map((f) => f.rel);
+		if (!hits.length) {
+			return {
+				output: truncated
+					? `(no matches — search was truncated; narrow target_directory or the pattern)`
+					: "(no matches)",
+			};
+		}
+		const more = matched.length - hits.length;
+		const notes: string[] = [];
+		if (more > 0) notes.push(`… (${more} more matches)`);
+		if (truncated) notes.push("(scan truncated: repo too large / time budget hit)");
+		return { output: hits.join("\n") + (notes.length ? "\n" + notes.join("\n") : "") };
 	} catch (e) {
 		return { output: `error: Glob failed: ${e instanceof Error ? e.message : String(e)}` };
 	}
 });
 
 // ---- FileSearch (fuzzy filename search) ----
+const FILESEARCH_MAX_RESULTS = 30;
+
 export const fileSearchTool = defineTool("FileSearch", false, async (input, abortSignal) => {
 	try {
-		const root = getWorkspaceRoot();
-		const all: string[] = [];
-		await walk(root, all, 0, false, abortSignal, 20_000);
-		if (abortSignal?.aborted) return { output: "(FileSearch aborted)" };
-		const q = String(input.query || "").toLowerCase();
+		const q = String(input.query || "").trim();
 		if (!q) return { output: "(empty query)" };
-		const rel = all.map((f) => path.relative(root, f).split(path.sep).join("/"));
-		const scored = rel
-			.map((f) => ({ f, score: fuzzyScore(f.toLowerCase(), q) }))
-			.filter((x) => x.score > 0)
-			.sort((a, b) => b.score - a.score)
-			.slice(0, 30)
-			.map((x) => x.f);
-		return { output: scored.join("\n") || "(no matches)" };
+		const root = getWorkspaceRoot();
+
+		const { files, truncated } = await scanFilesCached(root, {
+			signal: abortSignal,
+			maxFiles: 60_000,
+			timeMs: 10_000,
+		});
+		if (abortSignal?.aborted) return { output: "(FileSearch aborted)" };
+
+		const scored: Array<{ rel: string; score: number }> = [];
+		for (const f of files) {
+			const score = scorePath(f.rel, q);
+			if (score > 0) scored.push({ rel: f.rel, score });
+		}
+		scored.sort((a, b) => b.score - a.score || a.rel.length - b.rel.length || a.rel.localeCompare(b.rel));
+		const hits = scored.slice(0, FILESEARCH_MAX_RESULTS).map((x) => x.rel);
+		if (!hits.length) return { output: "(no matches)" };
+		const more = scored.length - hits.length;
+		const notes: string[] = [];
+		if (more > 0) notes.push(`… (${more} more, lower ranked)`);
+		if (truncated) notes.push("(scan truncated: repo too large / time budget hit)");
+		return { output: hits.join("\n") + (notes.length ? "\n" + notes.join("\n") : "") };
 	} catch (e) {
 		return { output: `error: FileSearch failed: ${e instanceof Error ? e.message : String(e)}` };
 	}

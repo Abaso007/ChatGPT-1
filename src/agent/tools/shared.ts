@@ -14,37 +14,26 @@ import type { ChildProcess } from "child_process";
 import type { SubagentRunner, QuestionAsker } from "./types";
 
 // Directories never walked/listed (tools + indexing).
-export const IGNORE = new Set([
-  ".git",
-  "node_modules",
-  "dist",
-  "out",
-  "build",
-  ".next",
-  ".nuxt",
-  ".output",
-  ".turbo",
-  ".cache",
-  "coverage",
-  ".venv",
-  "venv",
-  "__pycache__",
-  ".tox",
-  ".mypy_cache",
-  ".pytest_cache",
-  ".ruff_cache",
-  "target",
-  "vendor",
-  "Pods",
-  ".gradle",
-  ".idea",
-  ".vscode",
-  "bower_components",
-  "jspm_packages",
-  ".pnpm-store",
-  ".yarn",
-  "site-packages",
-]);
+export { IGNORE, BINARY_EXTS, NOISE_FILES, isNoisePath } from "./ignore";
+import { IGNORE } from "./ignore";
+
+// File discovery lives in fileScan.ts; re-exported here so existing tool
+// imports keep working.
+import { scanFiles } from "./fileScan";
+export {
+  scanFiles,
+  scanFilesCached,
+  invalidateScanCache,
+  compileGlob,
+  globToRe,
+  normalizeGlobPattern,
+  scorePath,
+  fuzzyScore,
+  type ScannedFile,
+  type ScanResult,
+  type ScanOptions,
+  type CompiledGlob,
+} from "./fileScan";
 
 // ---------------------------------------------------------------------------
 // Per-tool hard timeouts (ms). Prevents a hung Grep/Glob/Shell/etc. from
@@ -298,34 +287,13 @@ export async function walk(
   /** Soft cap so huge trees cannot hang the tool forever. */
   maxFiles = 20_000,
 ): Promise<void> {
-  if (depth > 10 || out.length >= maxFiles) return;
-  if (signal?.aborted) return;
-  let entries;
-  try {
-    entries = await fs.readdir(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const e of entries) {
-    if (signal?.aborted || out.length >= maxFiles) return;
-    if (!includeIgnored && IGNORE.has(e.name)) continue;
-    // Always skip the heaviest trees even when includeIgnored (Glob edge cases).
-    if (e.name === "node_modules" || e.name === ".git") {
-      if (!includeIgnored) continue;
-      // Still skip .git internals; allow node_modules only when explicitly requested.
-      if (e.name === ".git") continue;
-    }
-    const full = path.join(dir, e.name);
-    try {
-      if (e.isDirectory()) {
-        await walk(full, out, depth + 1, includeIgnored, signal, maxFiles);
-      } else if (e.isFile() || e.isSymbolicLink()) {
-        out.push(full);
-      }
-    } catch {
-      /* permission / race — skip entry */
-    }
-  }
+  const { files } = await scanFiles(dir, {
+    includeIgnored,
+    signal,
+    maxFiles: Math.max(0, maxFiles - out.length),
+    maxDepth: 24 - depth,
+  });
+  for (const f of files) out.push(f.abs);
 }
 
 /** Sort file paths by mtime, most-recently-modified first. Best-effort stat. */
@@ -343,32 +311,6 @@ export async function sortByMtime(files: string[]): Promise<string[]> {
   return withTimes.map((x) => x.f);
 }
 
-/** Convert a glob (supporting **, *, ?) into an anchored RegExp. */
-export function globToRe(p: string): RegExp {
-  const esc = p
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*\*/g, "\u0000")
-    .replace(/\*/g, "[^/]*")
-    .replace(/\u0000/g, ".*")
-    .replace(/\?/g, ".");
-  return new RegExp(`^${esc}$`);
-}
-
-/** Substring/subsequence fuzzy score (higher = better; 0 = no match). */
-export function fuzzyScore(text: string, query: string): number {
-  if (!query) return 0;
-  if (text.includes(query)) return 100 + (query.length / text.length) * 50;
-  let qi = 0;
-  let score = 0;
-  for (let i = 0; i < text.length && qi < query.length; i++) {
-    if (text[i] === query[qi]) {
-      score++;
-      qi++;
-    }
-  }
-  return qi === query.length ? score : 0;
-}
-
 /** Slugify a string for use as a filename. */
 export function slugify(s: string): string {
   return (
@@ -380,26 +322,51 @@ export function slugify(s: string): string {
   );
 }
 
-/** Whether ripgrep is available on PATH (cached; 3s probe timeout). */
-let rgCached: boolean | null = null;
-export function rgAvailable(): Promise<boolean> {
-  if (rgCached != null) return Promise.resolve(rgCached);
+/**
+ * Locate a usable ripgrep binary (cached).
+ *
+ * VS Code ships ripgrep inside its own installation, so prefer that over PATH:
+ * on Windows (and most user machines) `rg` is usually NOT on PATH, which used
+ * to silently downgrade Grep to the much slower node fallback.
+ */
+let rgPathCached: string | null | undefined;
+
+function bundledRgCandidates(): string[] {
+  const exe = process.platform === "win32" ? "rg.exe" : "rg";
+  const appRoot = process.env.VSCODE_CWD || "";
+  const roots: string[] = [];
+  try {
+    // process.execPath -> .../Code.exe ; ripgrep lives under resources/app.
+    const base = path.dirname(process.execPath);
+    roots.push(path.join(base, "resources", "app"));
+    roots.push(base);
+  } catch { /* ignore */ }
+  if (appRoot) roots.push(path.join(appRoot, "resources", "app"));
+  const out: string[] = [];
+  for (const r of roots) {
+    out.push(path.join(r, "node_modules", "@vscode", "ripgrep", "bin", exe));
+    out.push(path.join(r, "node_modules.asar.unpacked", "@vscode", "ripgrep", "bin", exe));
+    out.push(path.join(r, "node_modules", "vscode-ripgrep", "bin", exe));
+  }
+  return out;
+}
+
+function probeRg(cmd: string): Promise<boolean> {
   return new Promise((res) => {
     let settled = false;
     const finish = (v: boolean) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      rgCached = v;
       res(v);
     };
     const timer = setTimeout(() => {
-      try { c.kill(); } catch { /* ignore */ }
+      try { c?.kill(); } catch { /* ignore */ }
       finish(false);
     }, 3_000);
-    let c: ReturnType<typeof spawn>;
+    let c: ReturnType<typeof spawn> | undefined;
     try {
-      c = spawn("rg", ["--version"]);
+      c = spawn(cmd, ["--version"], { windowsHide: true });
     } catch {
       finish(false);
       return;
@@ -407,6 +374,29 @@ export function rgAvailable(): Promise<boolean> {
     c.on("error", () => finish(false));
     c.on("close", (code) => finish(code === 0));
   });
+}
+
+/** Absolute path or bare command for ripgrep; null when unavailable. */
+export async function rgCommand(): Promise<string | null> {
+  if (rgPathCached !== undefined) return rgPathCached;
+  for (const cand of bundledRgCandidates()) {
+    try {
+      await fs.access(cand);
+    } catch {
+      continue;
+    }
+    if (await probeRg(cand)) {
+      rgPathCached = cand;
+      return cand;
+    }
+  }
+  rgPathCached = (await probeRg("rg")) ? "rg" : null;
+  return rgPathCached;
+}
+
+/** Whether ripgrep is available (cached; 3s probe timeout). */
+export async function rgAvailable(): Promise<boolean> {
+  return (await rgCommand()) != null;
 }
 
 // ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ import * as vscode from "vscode";
 import * as path from "path";
 import { upsertFile, removeFile, buildIndex, setIndexingEnabled, warmIndex, isIndexingEnabled } from "./semanticIndex";
 import { getWorkspaceRoot } from "../context/workspaceUtils";
+import { invalidateScanCache } from "./tools/fileScan";
 import type { FeatureStore } from "../stores/featureStore";
 
 const DEBOUNCE_MS = 800;
@@ -93,9 +94,17 @@ export function initIndexWatch(context: vscode.ExtensionContext, store: FeatureS
   const watcher = vscode.workspace.createFileSystemWatcher("**/*");
   context.subscriptions.push(
     watcher,
-    watcher.onDidCreate((u) => onFs(u, "up")),
+    // Creates/deletes change the file set, so the search scan cache must drop
+    // immediately — independent of whether semantic indexing is enabled.
+    watcher.onDidCreate((u) => {
+      invalidateScanCache();
+      onFs(u, "up");
+    }),
     watcher.onDidChange((u) => onFs(u, "up")),
-    watcher.onDidDelete((u) => onFs(u, "del")),
+    watcher.onDidDelete((u) => {
+      invalidateScanCache();
+      onFs(u, "del");
+    }),
     vscode.workspace.onDidSaveTextDocument((doc) => onFs(doc.uri, "up")),
     store.onDidChange(() => {
       const on = store.get().indexingEnabled !== false;
@@ -105,6 +114,7 @@ export function initIndexWatch(context: vscode.ExtensionContext, store: FeatureS
       if (on) void buildIndex(getWorkspaceRoot()).catch(() => {});
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      invalidateScanCache();
       if (!isIndexingEnabled()) return;
       const f = featureStore?.get();
       if (f && f.indexNewFolders === false) return;
