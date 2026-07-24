@@ -19,6 +19,7 @@ import { getWorkspaceRoot } from "./workspaceUtils";
 import { search as searchCodebase } from "../agent/semanticIndex";
 import { type DocSource } from "../agent/docsIndex";
 import { listRules } from "./workspaceContext";
+import { scanFilesCached, scorePath } from "../agent/tools/fileScan";
 
 export type MentionKind =
   | "file" | "folder" | "code" | "doc" | "git" | "composer"
@@ -49,24 +50,71 @@ function git(args: string[]): Promise<string> {
 
 export async function searchFilesAndFolders(query: string, limit = 30): Promise<MentionItem[]> {
   const q = (query || "").trim();
-  const glob = q ? `**/*${q}*` : "**/*";
-  let items: MentionItem[] = [];
   try {
-    const uris = await vscode.workspace.findFiles(glob, "**/{node_modules,.git,dist,out,build}/**", 50);
-    const folders = new Set<string>();
-    items = uris.map((u) => {
-      const rel = vscode.workspace.asRelativePath(u, false);
-      const slash = rel.lastIndexOf("/");
-      if (slash > 0) folders.add(rel.slice(0, slash));
-      return { kind: "file" as const, path: rel, name: rel.split("/").pop() || rel, detail: rel };
-    });
-    for (const f of folders) {
-      if (!q || f.toLowerCase().includes(q.toLowerCase())) {
-        items.unshift({ kind: "folder", path: f, name: f.split("/").pop() || f, detail: f });
+    const root = getWorkspaceRoot();
+    const { files } = await scanFilesCached(root, { maxFiles: 40_000, timeMs: 4_000 });
+
+    // Rank files with the same scorer FileSearch uses (basename > path > fuzzy).
+    type Hit = { rel: string; score: number; isDir?: boolean };
+    const hits: Hit[] = [];
+    if (q) {
+      for (const f of files) {
+        const score = scorePath(f.rel, q);
+        if (score > 0) hits.push({ rel: f.rel, score });
+      }
+      hits.sort((a, b) => b.score - a.score || a.rel.length - b.rel.length);
+    } else {
+      // Empty query: newest files first (composer open state).
+      const newest = files.slice().sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, limit * 2);
+      for (const f of newest) hits.push({ rel: f.rel, score: f.mtimeMs });
+    }
+
+    // Folders: derive from matched paths + score folder names themselves.
+    const folders = new Map<string, number>();
+    for (const h of hits.slice(0, 80)) {
+      const parts = h.rel.split("/");
+      for (let i = 1; i < parts.length; i++) {
+        const dir = parts.slice(0, i).join("/");
+        const base = parts[i - 1].toLowerCase();
+        let s = folders.get(dir) ?? 0;
+        if (q) {
+          const ql = q.toLowerCase();
+          if (base === ql) s = Math.max(s, 900);
+          else if (base.startsWith(ql)) s = Math.max(s, 700);
+          else if (base.includes(ql) || dir.toLowerCase().includes(ql)) s = Math.max(s, 400);
+        } else {
+          s = Math.max(s, 1);
+        }
+        if (s > 0) folders.set(dir, s);
       }
     }
-  } catch { /* ignore */ }
-  return items.slice(0, limit);
+
+    const items: MentionItem[] = [];
+    const folderHits = [...folders.entries()]
+      .map(([rel, score]) => ({ rel, score }))
+      .sort((a, b) => b.score - a.score || a.rel.length - b.rel.length)
+      .slice(0, Math.min(8, limit));
+    for (const f of folderHits) {
+      items.push({
+        kind: "folder",
+        path: f.rel,
+        name: f.rel.split("/").pop() || f.rel,
+        detail: f.rel,
+      });
+    }
+    for (const h of hits) {
+      if (items.length >= limit) break;
+      items.push({
+        kind: "file",
+        path: h.rel,
+        name: h.rel.split("/").pop() || h.rel,
+        detail: h.rel,
+      });
+    }
+    return items.slice(0, limit);
+  } catch {
+    return [];
+  }
 }
 
 export async function searchCommits(query: string, limit = 15): Promise<MentionItem[]> {

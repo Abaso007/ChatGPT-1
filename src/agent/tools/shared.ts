@@ -15,11 +15,9 @@ import type { SubagentRunner, QuestionAsker } from "./types";
 
 // Directories never walked/listed (tools + indexing).
 export { IGNORE, BINARY_EXTS, NOISE_FILES, isNoisePath } from "./ignore";
-import { IGNORE } from "./ignore";
 
 // File discovery lives in fileScan.ts; re-exported here so existing tool
 // imports keep working.
-import { scanFiles } from "./fileScan";
 export {
   scanFiles,
   scanFilesCached,
@@ -267,48 +265,6 @@ export function firstDiffLine(before: string, after: string): number {
     if (a[i] !== b[i]) return i + 1;
   }
   return Math.min(a.length, b.length) + 1;
-}
-
-// ---------------------------------------------------------------------------
-// Filesystem walking / globbing / fuzzy matching
-// ---------------------------------------------------------------------------
-
-/**
- * Recursively collect file paths under `dir` (depth-capped). IGNORE dirs
- * (node_modules, .git, build caches, …) are skipped unless `includeIgnored` is true.
- * Always respects AbortSignal and maxFiles so explore tools cannot hang forever.
- */
-export async function walk(
-  dir: string,
-  out: string[],
-  depth: number,
-  includeIgnored = false,
-  signal?: AbortSignal,
-  /** Soft cap so huge trees cannot hang the tool forever. */
-  maxFiles = 20_000,
-): Promise<void> {
-  const { files } = await scanFiles(dir, {
-    includeIgnored,
-    signal,
-    maxFiles: Math.max(0, maxFiles - out.length),
-    maxDepth: 24 - depth,
-  });
-  for (const f of files) out.push(f.abs);
-}
-
-/** Sort file paths by mtime, most-recently-modified first. Best-effort stat. */
-export async function sortByMtime(files: string[]): Promise<string[]> {
-  const withTimes = await Promise.all(
-    files.map(async (f) => {
-      let mtimeMs = 0;
-      try {
-        mtimeMs = (await fs.stat(f)).mtimeMs;
-      } catch {}
-      return { f, mtimeMs };
-    })
-  );
-  withTimes.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  return withTimes.map((x) => x.f);
 }
 
 /** Slugify a string for use as a filename. */

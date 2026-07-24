@@ -436,27 +436,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
   /** Fuzzy file/folder search for @-mentions in the composer. */
   private async _searchFiles(query: string, requestId: number) {
+    // Same scorer + scan cache as FileSearch / categorized @-mentions.
     let items: { path: string; name: string; kind: "file" | "folder" }[] = [];
     try {
-      const q = (query || "").trim();
-      const glob = q ? `**/*${q}*` : "**/*";
-      const uris = await vscode.workspace.findFiles(glob, "**/{node_modules,.git,dist,out,build}/**", 50);
-      const folders = new Set<string>();
-      items = uris.map((u) => {
-        const rel = vscode.workspace.asRelativePath(u, false);
-        const slash = rel.lastIndexOf("/");
-        if (slash > 0) {
-          folders.add(rel.slice(0, slash));
-        }
-        return { path: rel, name: rel.split("/").pop() || rel, kind: "file" as const };
-      });
-      // Surface matching folders too.
-      for (const f of folders) {
-        if (!q || f.toLowerCase().includes(q.toLowerCase())) {
-          items.unshift({ path: f, name: f.split("/").pop() || f, kind: "folder" });
-        }
-      }
-      items = items.slice(0, 30);
+      const hits = await searchFilesAndFolders(query, 30);
+      items = hits
+        .filter((h) => h.kind === "file" || h.kind === "folder")
+        .map((h) => ({ path: h.path, name: h.name, kind: h.kind as "file" | "folder" }));
     } catch {
       items = [];
     }

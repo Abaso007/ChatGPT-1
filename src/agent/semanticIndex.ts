@@ -21,7 +21,7 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as crypto from "crypto";
-import { walk } from "./tools/shared";
+import { scanFiles } from "./tools/fileScan";
 import { importRuntimeDep } from "../runtimeDeps";
 
 // Selectable local embedding models. Add entries here to offer more choices.
@@ -574,21 +574,23 @@ export async function buildIndex(root: string, onProgress?: (done: number, total
   emitStatus(root);
   try {
     const idx = await load(root);
-    const all: string[] = [];
-    await walk(root, all, 0);
+    // Parallel scan + mtime/size in one pass (replaces serial walk + per-file stat).
+    const { files: scanned } = await scanFiles(root, {
+      maxFiles: 100_000,
+      timeMs: 60_000,
+      useGitignore: true,
+    });
     const targets: string[] = [];
     const seen = new Set<string>();
-    for (const f of all) {
-      const rel = path.relative(root, f).split(path.sep).join("/");
+    for (const f of scanned) {
+      const rel = f.rel;
       if (!isIndexableRel(rel)) continue;
-      let st;
-      try { st = await fs.stat(f); } catch { continue; }
-      if (st.size > MAX_FILE_BYTES) continue;
+      if (f.size > MAX_FILE_BYTES) continue;
       seen.add(rel);
-      const hash = `${Math.round(st.mtimeMs)}:${st.size}`;
+      const hash = `${Math.round(f.mtimeMs)}:${f.size}`;
       const prev = idx.files[rel];
       // Accept either rounded or raw mtime strings from older indexes.
-      if (prev !== hash && prev !== `${st.mtimeMs}:${st.size}`) targets.push(rel);
+      if (prev !== hash && prev !== `${f.mtimeMs}:${f.size}`) targets.push(rel);
     }
     const changed = new Set(targets);
     idx.chunks = idx.chunks.filter((c) => seen.has(c.path) && !changed.has(c.path));
