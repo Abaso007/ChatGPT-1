@@ -11,7 +11,7 @@ import * as vscode from "vscode";
 import * as crypto from "crypto";
 import * as http from "http";
 import { ProviderEvent, ToolSchema, WireMessage } from "./types";
-import { ChatHTTPError, applyAnthropicReasoning } from "./provider";
+import { ChatHTTPError, applyAnthropicReasoning, defaultAnthropicMaxTokens, needsContext1mBeta } from "./provider";
 
 export type {
   OAuthKind,
@@ -48,7 +48,19 @@ const ANTHROPIC = {
   port: 54545,
   path: "/callback",
   scope: "org:create_api_key user:profile user:inference",
-  models: ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-opus-4-5", "claude-haiku-4-5"],
+  // Curated Claude Code subscription models. Merged with /v1/models so new
+  // aliases (opus-5 / fable-5 / sonnet-5) stay selectable even when the list
+  // endpoint lags or omits them.
+  models: [
+    "claude-fable-5",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-opus-4-5",
+    "claude-haiku-4-5",
+  ],
 } as const;
 
 const CODEX = {
@@ -702,8 +714,9 @@ async function getAntigravityLimits(acc: OAuthAccount): Promise<OAuthLimit[]> {
 
 export async function listOAuthModels(kind: OAuthKind): Promise<string[]> {
   if (kind === "claude-code") {
+    const curated = [...ANTHROPIC.models];
     const acc = firstOfKind("claude-code");
-    if (!acc) return [...ANTHROPIC.models];
+    if (!acc) return curated;
     try {
       const fresh = await validAccount(acc.id);
       // /v1/models is reachable with the OAuth bearer + oauth beta header.
@@ -717,13 +730,23 @@ export async function listOAuthModels(kind: OAuthKind): Promise<string[]> {
       });
       if (r.ok) {
         const d: any = await r.json();
-        const ids = (d?.data ?? []).map((m: any) => m.id).filter(Boolean);
-        if (ids.length) return ids;
+        const ids = (d?.data ?? []).map((m: any) => m.id).filter(Boolean) as string[];
+        if (ids.length) {
+          // Prefetch may omit brand-new aliases; always keep curated IDs first.
+          const seen = new Set<string>();
+          const merged: string[] = [];
+          for (const id of [...curated, ...ids]) {
+            if (seen.has(id)) continue;
+            seen.add(id);
+            merged.push(id);
+          }
+          return merged;
+        }
       }
     } catch {
       /* fall through to preset */
     }
-    return [...ANTHROPIC.models];
+    return curated;
   }
   if (kind === "antigravity") {
     const acc = firstOfKind("antigravity");
@@ -807,7 +830,9 @@ async function* streamClaudeCode(id: string, opts: {
   const { system, messages } = toAnthropic(opts.messages);
   // OAuth requires the Claude Code identity as the first system block.
   system.unshift({ type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." });
-  const maxTokens = opts.maxTokens && opts.maxTokens > 0 ? opts.maxTokens : 8192;
+  const maxTokens = opts.maxTokens && opts.maxTokens > 0
+    ? opts.maxTokens
+    : defaultAnthropicMaxTokens(opts.model, opts.modelParams?.reasoningEffort);
   const body: Record<string, unknown> = { model: opts.model, system, messages, stream: true, max_tokens: maxTokens };
   const reasoningBetas = applyAnthropicReasoning(body, opts.model, maxTokens, opts.modelParams);
   if (opts.tools?.length) {
@@ -815,7 +840,10 @@ async function* streamClaudeCode(id: string, opts: {
   }
 
   const betas = ["oauth-2025-04-20", ...reasoningBetas];
-  if (opts.modelParams?.maxContext === "1m") betas.push("context-1m-2025-08-07");
+  // 1M is the default on Opus 5 / Fable 5 / Sonnet 5 / 4.6+ — beta only for older models.
+  if (opts.modelParams?.maxContext === "1m" && needsContext1mBeta(opts.model)) {
+    betas.push("context-1m-2025-08-07");
+  }
   const r = await fetch("https://api.anthropic.com/v1/messages?beta=true", {
     method: "POST",
     headers: {
@@ -939,6 +967,13 @@ async function* parseAnthropicStream(reader: ReadableStreamDefaultReader<Uint8Ar
       if (!data || data === "[DONE]") continue;
       let chunk: any;
       try { chunk = JSON.parse(data); } catch { continue; }
+      // Anthropic can stream a 200 OK then an in-band `error` event (overloaded,
+      // invalid model, mid-stream effort/thinking rejection). Without this the
+      // frame is silently dropped and the turn ends with no text and no error.
+      if (chunk.type === "error") {
+        const e = chunk.error ?? {};
+        throw new ChatHTTPError(502, `claude-code stream error: ${e.type ?? "error"} — ${e.message ?? data.slice(0, 300)}`);
+      }
       if (chunk.type === "content_block_start" && chunk.content_block?.type === "tool_use") {
         const cb = chunk.content_block;
         toolBlocks[chunk.index] = { id: cb.id, name: cb.name, args: "" };
@@ -962,6 +997,9 @@ async function* parseAnthropicStream(reader: ReadableStreamDefaultReader<Uint8Ar
   for (const idx of Object.keys(toolBlocks).map(Number).sort((a, b) => a - b)) {
     const a = toolBlocks[idx];
     if (a.name) yield { type: "tool-call", call: { id: a.id || `call_${idx}`, name: a.name, arguments: a.args || "{}" } };
+  }
+  if (finishReason === "refusal") {
+    throw new ChatHTTPError(400, "claude-code refused the request (safety classifier). Try Opus 5 or another model, or rephrase.");
   }
   yield { type: "done", finishReason };
 }

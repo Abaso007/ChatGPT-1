@@ -25,14 +25,38 @@ function applyOpenAISampling(body: Record<string, unknown>, s?: SamplingParams) 
 }
 
 /** Models that take the `effort` param as a stable feature (no beta header). */
-const ANTHROPIC_EFFORT_STABLE = /claude-(opus-4-[678]|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
+const ANTHROPIC_EFFORT_STABLE = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
 /** Opus 4.5 needs the effort beta header + manual thinking budget. */
 const ANTHROPIC_EFFORT_BETA = /claude-opus-4-5/i;
 /** Models that support adaptive thinking (no budget_tokens). */
-const ANTHROPIC_ADAPTIVE = /claude-(opus-4-[678]|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
+const ANTHROPIC_ADAPTIVE = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
 /** Models that reject manual `thinking:{type:enabled,budget_tokens}` with a 400.
- * Per docs: Opus 4.8/4.7, Sonnet 5, Fable 5, Mythos 5 → adaptive only. */
-const ANTHROPIC_NO_MANUAL = /claude-(opus-4-[78]|sonnet-5|fable-5|mythos)/i;
+ * Per docs: Opus 5, Opus 4.8/4.7, Sonnet 5, Fable 5, Mythos 5 → adaptive only. */
+const ANTHROPIC_NO_MANUAL = /claude-(opus-4-[78]|opus-5|sonnet-5|fable-5|mythos)/i;
+/** Opus 5 rejects `thinking:{type:disabled}` when effort is xhigh/max (400). */
+const ANTHROPIC_DISABLE_NEEDS_LOW_EFFORT = /claude-opus-5/i;
+/** Fable 5 / Mythos 5: thinking is always on — `disabled` returns 400 at any effort. */
+const ANTHROPIC_NO_DISABLE = /claude-(fable-5|mythos)/i;
+/** Models that reject temperature / top_p / top_k with a 400. */
+const ANTHROPIC_NO_SAMPLING = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
+/** Models where 1M context is the default (no context-1m beta header needed). */
+const ANTHROPIC_NATIVE_1M = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
+
+/** Default max_tokens when the user left response length at "auto" (0).
+ * Adaptive / always-on thinking models burn this budget before text, so leave
+ * headroom — docs recommend ≥64k at xhigh/max. */
+export function defaultAnthropicMaxTokens(model: string, effort?: string): number {
+  if (ANTHROPIC_ADAPTIVE.test(model) || ANTHROPIC_NO_DISABLE.test(model)) {
+    if (effort === "xhigh" || effort === "max") return 65_536;
+    return 32_768;
+  }
+  return 8192;
+}
+
+/** Whether the retired context-1m beta header is still useful for this model. */
+export function needsContext1mBeta(model: string): boolean {
+  return !ANTHROPIC_NATIVE_1M.test(model);
+}
 
 /**
  * Apply Anthropic thinking + effort to a request body, returning any beta flags
@@ -47,12 +71,29 @@ export function applyAnthropicReasoning(
   params?: ModelParams,
 ): string[] {
   const betas: string[] = [];
-  const mode = params?.thinking; // "disabled" | "adaptive" | "enabled" | undefined
-  const effort = params?.reasoningEffort;
+  let mode = params?.thinking; // "disabled" | "adaptive" | "enabled" | undefined
+  let effort = params?.reasoningEffort;
+
+  // Fable/Mythos reject thinking:{disabled} entirely — coerce to adaptive.
+  if (mode === "disabled" && ANTHROPIC_NO_DISABLE.test(model)) {
+    mode = "adaptive";
+  }
+
+  // Opus 5 rejects thinking:{disabled} above `high` effort. Clamp rather than
+  // sending a request we know will 400.
+  if (mode === "disabled" && effort && ANTHROPIC_DISABLE_NEEDS_LOW_EFFORT.test(model)
+    && (effort === "xhigh" || effort === "max")) {
+    effort = "high";
+  }
 
   if (effort && (ANTHROPIC_EFFORT_STABLE.test(model) || ANTHROPIC_EFFORT_BETA.test(model))) {
     body.output_config = { effort };
     if (ANTHROPIC_EFFORT_BETA.test(model)) betas.push("effort-2025-11-24");
+  }
+
+  // Thinking is on by default from Opus 5 onward, so opting out has to be explicit.
+  if (mode === "disabled" && ANTHROPIC_DISABLE_NEEDS_LOW_EFFORT.test(model)) {
+    body.thinking = { type: "disabled" };
   }
 
   if (mode && mode !== "disabled") {
@@ -67,7 +108,7 @@ export function applyAnthropicReasoning(
       body.thinking = { type: "enabled", budget_tokens: Math.max(1024, Math.floor(maxTokens * frac)) };
       body.temperature = 1; // required when manual thinking is enabled
     } else {
-      // Adaptive-only models (Opus 4.8/4.7, Sonnet 5, Fable 5, Mythos): the model
+      // Adaptive-only models (Opus 5/4.8/4.7, Sonnet 5, Fable 5, Mythos): the model
       // decides when/how much to think; effort steers depth. No budget_tokens.
       // `display` defaults to "omitted" → thinking happens but blocks come back
       // empty; ask for "summarized" so summaries stream.
@@ -77,8 +118,8 @@ export function applyAnthropicReasoning(
   return betas;
 }
 
-function applyAnthropicSampling(body: Record<string, unknown>, s?: SamplingParams) {
-  if (!s) return;
+function applyAnthropicSampling(body: Record<string, unknown>, model: string, s?: SamplingParams) {
+  if (!s || ANTHROPIC_NO_SAMPLING.test(model)) return;
   if (s.topP != null) body.top_p = s.topP;
   if (s.topK != null) body.top_k = s.topK;
   if (s.stopSequences && s.stopSequences.length) body.stop_sequences = s.stopSequences;
@@ -647,7 +688,9 @@ async function* streamAnthropic(opts: {
 }): AsyncGenerator<ProviderEvent> {
   const { system, messages } = toAnthropic(opts.messages);
 
-  const maxTokens = opts.maxTokens && opts.maxTokens > 0 ? opts.maxTokens : 8192;
+  const maxTokens = opts.maxTokens && opts.maxTokens > 0
+    ? opts.maxTokens
+    : defaultAnthropicMaxTokens(opts.model, opts.modelParams?.reasoningEffort);
   const body: Record<string, unknown> = {
     model: opts.model,
     system,
@@ -659,7 +702,7 @@ async function* streamAnthropic(opts: {
   // so we don't send it for Anthropic — it applies its own default. Thinking is
   // the one case that needs an explicit temperature (=1).
   const reasoningBetas = applyAnthropicReasoning(body, opts.model, maxTokens, opts.modelParams);
-  applyAnthropicSampling(body, opts.sampling);
+  applyAnthropicSampling(body, opts.model, opts.sampling);
   if (opts.tools?.length) {
     body.tools = opts.tools.map((t) => ({
       name: t.function.name,
@@ -668,9 +711,12 @@ async function* streamAnthropic(opts: {
     }));
   }
 
-  // 1M context window is gated behind a beta header on Claude 4.x.
+  // 1M context is native on Opus 5 / Fable 5 / Sonnet 5 / 4.6+; beta is only
+  // needed for older models that still gate long context behind it.
   const betas: string[] = [...reasoningBetas];
-  if (opts.modelParams?.maxContext === "1m") betas.push("context-1m-2025-08-07");
+  if (opts.modelParams?.maxContext === "1m" && needsContext1mBeta(opts.model)) {
+    betas.push("context-1m-2025-08-07");
+  }
   const r = await fetch(`${opts.apiBaseUrl}/messages`, {
     method: "POST",
     headers: {
@@ -712,6 +758,12 @@ async function* streamAnthropic(opts: {
         continue;
       }
 
+      // In-band error frames arrive on a 200 response (overloaded, invalid
+      // model, mid-stream rejection). Surface them instead of ending empty.
+      if (chunk.type === "error") {
+        const e = chunk.error ?? {};
+        throw new ChatHTTPError(502, `anthropic stream error: ${e.type ?? "error"} — ${e.message ?? data.slice(0, 300)}`);
+      }
       if (chunk.type === "content_block_start") {
         const cb = chunk.content_block;
         if (cb?.type === "tool_use") {
@@ -746,6 +798,9 @@ async function* streamAnthropic(opts: {
     const a = toolBlocks[idx];
     if (!a.name) continue;
     yield { type: "tool-call", call: { id: a.id || `call_${idx}`, name: a.name, arguments: a.args || "{}" } };
+  }
+  if (finishReason === "refusal") {
+    throw new ChatHTTPError(400, "Model refused the request (safety classifier). Try Opus 5 or another model, or rephrase.");
   }
   yield { type: "done", finishReason };
 }

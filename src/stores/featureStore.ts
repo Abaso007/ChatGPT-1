@@ -132,12 +132,17 @@ export const MODEL_CATALOG: ModelDef[] = [
 	{ id: "gpt-5.4", name: "GPT-5.4", kind: ["openai", "codex"], options: [effort("medium", ["none", "low", "medium", "high", "xhigh"]), ctx(["128k", "256k", "400k"], "400k")] },
 	{ id: "gpt-5.4-mini", name: "GPT-5.4 mini", kind: ["openai", "codex"], options: [effort("medium", ["none", "low", "medium", "high"]), ctx(["128k", "400k"], "400k")] },
 	{ id: "gpt-5.3-codex", name: "GPT-5.3 Codex", kind: ["openai", "codex"], options: [effort("high", ["none", "low", "medium", "high", "xhigh"]), ctx(["128k", "256k", "400k"], "400k")] },
-	// Anthropic — Opus 4.8 is the current flagship. effort → output_config.effort;
-	// extended thinking + up to 1M (beta) context.
-	// Fable 5 and Sonnet 5 are adaptive-only: manual budget_tokens returns 400.
+	// Anthropic — Opus 5 is the current flagship. effort → output_config.effort;
+	// 1M context is native (no beta). Adaptive thinking on by default for Opus 5 /
+	// Sonnet 5; always-on for Fable 5 (disabled unsupported).
+	// Fable 5, Opus 5 and Sonnet 5 are adaptive-only: manual budget_tokens returns 400.
 	{ id: "claude-sonnet-5", name: "Sonnet 5", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["200k", "1m"], "1m")] },
 	// Fable 5: thinking always on, adaptive is the only mode (disabled unsupported).
-	{ id: "claude-fable-5", name: "Fable 5", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["200k", "1m"], "1m")] },
+	{ id: "claude-fable-5", name: "Fable 5", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["1m"], "1m")] },
+	// Opus 5: thinking on by default; 1M is both the default and the max (no 200k
+	// variant). "disabled" is only accepted at effort high or below — the provider
+	// clamps effort down instead of letting the request 400.
+	{ id: "claude-opus-5", name: "Opus 5", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["1m"], "1m")] },
 	// Opus 4.8/4.7: adaptive is the ONLY thinking mode; enabled/budget → 400.
 	{ id: "claude-opus-4-8", name: "Opus 4.8", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["200k", "1m"], "1m")] },
 	{ id: "claude-opus-4-7", name: "Opus 4.7", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["200k", "1m"], "200k")] },
