@@ -615,7 +615,7 @@ function editPreview(name: string, i: any): string {
   return "";
 }
 
-export function ToolCard({ block, onImplement, onOpenSubagent }: { block: ToolBlock; onImplement?: (path: string) => void; onOpenSubagent?: (callId: string) => void }) {
+function ToolCardInner({ block, onImplement, onOpenSubagent }: { block: ToolBlock; onImplement?: (path: string) => void; onOpenSubagent?: (callId: string) => void }) {
   if (block.name === "write_plan" || block.name === "WritePlan") return <PlanCard block={block} onImplement={onImplement} />;
   if (block.name === "ask_question" || block.name === "AskQuestion") return <QuestionCard block={block} />;
   if (block.name === "read_file" || block.name === "Read") return <ReadLine block={block} />;
@@ -704,6 +704,13 @@ export function ToolCard({ block, onImplement, onOpenSubagent }: { block: ToolBl
     </div>
   );
 }
+
+// Tool cards are the most numerous nodes in a long chat and their content is
+// immutable once the call settles. Re-render only when this block's own
+// identity/state changes, not on every stream frame elsewhere in the run.
+export const ToolCard = React.memo(ToolCardInner, (a, b) =>
+  a.block === b.block && a.onImplement === b.onImplement && a.onOpenSubagent === b.onOpenSubagent,
+);
 
 function CopyCommandButton({ command }: { command: string }) {
   const [copied, setCopied] = React.useState(false);

@@ -22,14 +22,43 @@ function sanitize(html: string): string {
     .replace(/(href|src)\s*=\s*("|')\s*javascript:[^"']*\2/gi, '$1="#"');
 }
 
+// Parsing + sanitizing is the single most expensive thing the webview does per
+// frame: during streaming the same message is re-rendered on every delta, each
+// time re-parsing the ENTIRE text from scratch (quadratic in message length).
+// A small LRU keyed on the exact source makes repeat renders free, which covers
+// both React re-renders that didn't change the text and scrollback redraws.
+const CACHE_LIMIT = 240;
+const cache = new Map<string, string>();
+
+function cached(src: string, compute: () => string): string {
+  const hit = cache.get(src);
+  if (hit !== undefined) {
+    // Refresh recency (Map preserves insertion order).
+    cache.delete(src);
+    cache.set(src, hit);
+    return hit;
+  }
+  const html = compute();
+  cache.set(src, html);
+  if (cache.size > CACHE_LIMIT) {
+    // Evict oldest.
+    const oldest = cache.keys().next().value as string | undefined;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  return html;
+}
+
 export function renderMarkdown(srcIn: string): string {
   const src = String(srcIn == null ? "" : srcIn);
-  try {
-    return sanitize(marked.parse(src, { async: false }) as string);
-  } catch {
-    // Fallback: render as escaped plain text on parser failure.
-    return "<p>" + src.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") + "</p>";
-  }
+  if (!src) return "";
+  return cached(src, () => {
+    try {
+      return sanitize(marked.parse(src, { async: false }) as string);
+    } catch {
+      // Fallback: render as escaped plain text on parser failure.
+      return "<p>" + src.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") + "</p>";
+    }
+  });
 }
 
 export function basename(p: string): string {

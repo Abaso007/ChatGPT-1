@@ -247,9 +247,12 @@ function ExploringSection({
   );
 }
 
-function Markdown({ text }: { text: string }) {
+// Memoized: during streaming the whole turn list re-renders on every frame, but
+// only the trailing block's text actually changes. Without this, every earlier
+// message in the conversation re-parses its markdown on each delta.
+const Markdown = React.memo(function Markdown({ text }: { text: string }) {
   return <div className="markdown-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(text) }} />;
-}
+});
 
 // Render <attached /> tags as the SAME pill as the composer editor:
 // [kind icon] name — shares .mention CSS and KIND_SVG icons.
@@ -878,6 +881,11 @@ export function App() {
   const persistTimers = React.useRef(new Map<string, number>());
   const schedulePersist = (id: string, s: ChatSession) => {
     if (!id || persistTimers.current.has(id)) return;
+    // While a run is live the HOST owns turns and persists them itself; it drops
+    // webview snapshots for such conversations. Sending them anyway would
+    // structured-clone the whole transcript (tool results included) across the
+    // bridge every 800ms just to be discarded.
+    if (s.running) return;
     const t = window.setTimeout(() => {
       persistTimers.current.delete(id);
       post({ type: "persistTurns", convId: id, turns: s.turns });
@@ -1222,7 +1230,8 @@ export function App() {
   };
 
   // Switch to agent mode and kick off implementation of a written plan.
-  const onImplement = (planPath: string) => {
+  // Stable identity so memoized tool cards aren't invalidated every frame.
+  const onImplement = React.useCallback((planPath: string) => {
     setMode("agent");
     post({ type: "setMode", mode: "agent" });
     const text = planPath
@@ -1233,7 +1242,10 @@ export function App() {
     pinTopRef.current = true;
     force();
     post({ type: "sendMessage", text });
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const onOpenSubagent = React.useCallback((id: string) => setSubTab(id), []);
 
   // Locate the subagent (task) ToolBlock for the open sub-tab.
   const findSub = (callId: string): import("./types").ToolBlock | undefined => {
@@ -1502,7 +1514,7 @@ export function App() {
                             tools={b.tools}
                             live={isRunning && lastTurn && bi === items.length - 1}
                             onImplement={onImplement}
-                            onOpenSubagent={(id) => setSubTab(id)}
+                            onOpenSubagent={onOpenSubagent}
                             approvals={approvalsByCall}
                           />
                         ) : b.kind === "text" ? (
@@ -1519,7 +1531,7 @@ export function App() {
                           <div className="block-group" key={bi}><MaxStepsCard block={b} running={isRunning} /></div>
                         ) : (
                           <div className="block-group" key={bi}>
-                            <ToolCard block={b} onImplement={onImplement} onOpenSubagent={(id) => setSubTab(id)} />
+                            <ToolCard block={b} onImplement={onImplement} onOpenSubagent={onOpenSubagent} />
                             {b.callId && approvalsByCall[b.callId] && <ApprovalCard request={approvalsByCall[b.callId]} inline />}
                           </div>
                         )

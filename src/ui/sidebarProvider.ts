@@ -1343,8 +1343,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         this._view?.webview.postMessage({ type: "agentEvent", convId, event });
       }
     };
+    // runAgent already coalesces deltas per stream policy before they get here,
+    // so this layer only needs to absorb bursts (retries, parallel subagents)
+    // without adding a second full interval of latency to every token.
     const scheduleUi = () => {
-      if (!uiTimer) uiTimer = setTimeout(flushUi, 48);
+      if (!uiTimer) uiTimer = setTimeout(flushUi, 16);
     };
     const emit = (event: AgentEvent) => {
       if (event.type === "error") {

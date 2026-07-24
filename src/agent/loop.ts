@@ -20,6 +20,13 @@ import { mcpManager } from "../integrations/mcpClient";
 import type { AgentEvent, Attachment, Mode, Step, ToolCall, ToolSchema } from "./types";
 import type { SubagentDef } from "../stores/featureStore";
 import type { RunAgentOptions } from "./loopTypes";
+import {
+	streamPolicyFor,
+	clipArgsText,
+	TEXT_INTERVAL_MS,
+	THINKING_INTERVAL_MS,
+	SUBAGENT_INTERVAL_MS,
+} from "../shared/streamPolicy";
 
 // Appended after every live user query in multitask mode so the model never
 // forgets it is a COORDINATOR: edit tools are disabled and all work must be
@@ -31,30 +38,54 @@ const MULTITASK_REMINDER =
 	"(run_in_background=true), launching multiple subagents AT THE SAME TIME in a single turn.\n</reminder>";
 
 const MAX_STEPS = 50;
-/** Coalesce high-frequency stream UI events (ms). */
-const STREAM_COALESCE_MS = 40;
 
 /**
  * Batch text/thinking/tool-args deltas so streaming cannot flood the host
  * reducer + webview (main cause of UI freezes that look like "stuck" tools).
  * Terminal events flush pending deltas first to preserve order.
+ *
+ * Cadence is per-event-class rather than one global interval: assistant text is
+ * the primary signal and stays snappy, while reasoning traces, subagent chatter,
+ * and tool arguments batch progressively harder. Tool args additionally obey the
+ * per-tool policy — most tools only need one early update to title their card,
+ * so their arg deltas are dropped instead of rendered frame after frame.
  */
 function coalesceEmit(raw: (e: AgentEvent) => void): (e: AgentEvent) => void {
 	const pending = new Map<string, AgentEvent>();
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	let timerDue = 0;
+	// Tool name per callId, so arg deltas can be matched to a policy.
+	const toolNames = new Map<string, string>();
+	// callIds whose "once" preview has already been sent.
+	const argsSent = new Set<string>();
 	const flush = () => {
 		timer = undefined;
+		timerDue = 0;
 		if (!pending.size) return;
 		const batch = [...pending.values()];
 		pending.clear();
 		for (const e of batch) {
+			// A "once" preview counts as spent only when it actually ships, so the
+			// single update carries the most complete args seen in the window
+			// (not the first 4-character fragment).
+			if (e.type === "tool-call-args") argsSent.add(e.callId);
 			try { raw(e); } catch { /* ignore */ }
 		}
 	};
-	const schedule = () => {
-		if (!timer) timer = setTimeout(flush, STREAM_COALESCE_MS);
+	// Earliest deadline wins: a pending fast event must not be delayed by a
+	// slower one already holding the timer.
+	const schedule = (delay: number) => {
+		const due = Date.now() + delay;
+		if (timer) {
+			if (due >= timerDue) return;
+			clearTimeout(timer);
+		}
+		timerDue = due;
+		timer = setTimeout(flush, delay);
 	};
 	return (event: AgentEvent) => {
+		// Remember the tool name so its arg deltas can be policed below.
+		if (event.type === "tool-call-started") toolNames.set(event.callId, event.name);
 		if (event.type === "text-delta") {
 			const prev = pending.get("text");
 			if (prev && prev.type === "text-delta") {
@@ -62,7 +93,7 @@ function coalesceEmit(raw: (e: AgentEvent) => void): (e: AgentEvent) => void {
 			} else {
 				pending.set("text", event);
 			}
-			schedule();
+			schedule(TEXT_INTERVAL_MS);
 			return;
 		}
 		if (event.type === "thinking-delta") {
@@ -72,13 +103,20 @@ function coalesceEmit(raw: (e: AgentEvent) => void): (e: AgentEvent) => void {
 			} else {
 				pending.set("think", event);
 			}
-			schedule();
+			schedule(THINKING_INTERVAL_MS);
 			return;
 		}
 		if (event.type === "tool-call-args") {
+			const policy = streamPolicyFor(toolNames.get(event.callId));
+			if (policy.args === "off") return;
+			if (policy.args === "once" && argsSent.has(event.callId)) return;
 			// Latest full argsText wins (provider sends cumulative chunks).
-			pending.set(`args:${event.callId}`, event);
-			schedule();
+			pending.set(`args:${event.callId}`, {
+				type: "tool-call-args",
+				callId: event.callId,
+				argsText: clipArgsText(event.argsText, policy.maxChars),
+			});
+			schedule(policy.intervalMs);
 			return;
 		}
 		if (event.type === "subagent-event") {
@@ -103,14 +141,18 @@ function coalesceEmit(raw: (e: AgentEvent) => void): (e: AgentEvent) => void {
 				} else {
 					pending.set(key, event);
 				}
-				schedule();
+				schedule(SUBAGENT_INTERVAL_MS);
 				return;
 			}
 		}
 		// Ordering: flush coalesced deltas before discrete events.
 		if (pending.size) {
-			if (timer) { clearTimeout(timer); timer = undefined; }
+			if (timer) { clearTimeout(timer); timer = undefined; timerDue = 0; }
 			flush();
+		}
+		if (event.type === "tool-call-completed") {
+			toolNames.delete(event.callId);
+			argsSent.delete(event.callId);
 		}
 		try { raw(event); } catch { /* ignore */ }
 	};

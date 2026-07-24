@@ -183,6 +183,15 @@ export function parsePartialArgs(argsText: string, prev: unknown): unknown {
   }
 }
 
+/** Index of the tool block with `callId`, searched newest-first. */
+function findToolIndex(blocks: AssistantBlock[], callId: string): number {
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i];
+    if (b.kind === "tool" && b.callId === callId) return i;
+  }
+  return -1;
+}
+
 // Merge a streaming event into a flat block list (used for both the main turn
 // and a subagent's nested sub-chat). Returns a fresh copy.
 export function applyToBlocks(blocksIn: AssistantBlock[], ev: AgentEvent): AssistantBlock[] {
@@ -223,15 +232,19 @@ export function applyToBlocks(blocksIn: AssistantBlock[], ev: AgentEvent): Assis
       });
     }
   } else if (ev.type === "tool-call-args") {
-    return blocks.map((b) =>
-      b.kind === "tool" && b.callId === ev.callId ? { ...b, input: parsePartialArgs(ev.argsText, b.input) } : b
-    );
+    const i = findToolIndex(blocks, ev.callId);
+    if (i < 0) return blocksIn;
+    const b = blocks[i] as ToolBlock;
+    const input = parsePartialArgs(ev.argsText, b.input);
+    if (input === b.input) return blocksIn;
+    blocks[i] = { ...b, input };
+    return blocks;
   } else if (ev.type === "tool-call-completed") {
-    return blocks.map((b) =>
-      b.kind === "tool" && b.callId === ev.callId
-        ? { ...b, status: ev.status, result: ev.result, diff: ev.diff, startLine: ev.startLine, endLine: ev.endLine }
-        : b
-    );
+    const i = findToolIndex(blocks, ev.callId);
+    if (i < 0) return blocksIn;
+    const b = blocks[i] as ToolBlock;
+    blocks[i] = { ...b, status: ev.status, result: ev.result, diff: ev.diff, startLine: ev.startLine, endLine: ev.endLine };
+    return blocks;
   } else if (ev.type === "retry") {
     const note: ErrorBlock = { kind: "error", message: ev.error, retrying: { attempt: ev.attempt, max: ev.max } };
     if (last && last.kind === "error") blocks[blocks.length - 1] = note;
@@ -248,6 +261,20 @@ export function applyToBlocks(blocksIn: AssistantBlock[], ev: AgentEvent): Assis
     blocks.push({ kind: "max-steps", steps: ev.steps });
   }
   return blocks;
+}
+
+/**
+ * Index of the tool block with `callId` in the trailing assistant turn, or -1.
+ * Searched from the end because streaming always targets the newest call.
+ */
+function lastIndexOfTool(turns: Turn[], callId: string): number {
+  const last = turns[turns.length - 1];
+  if (!last || last.role !== "assistant") return -1;
+  for (let i = last.blocks.length - 1; i >= 0; i--) {
+    const b = last.blocks[i];
+    if (b.kind === "tool" && b.callId === callId) return i;
+  }
+  return -1;
 }
 
 // Apply a streaming agent event to the turns array (immutably).
@@ -331,36 +358,41 @@ export function applyEvent(turns: Turn[], ev: AgentEvent): Turn[] {
   }
 
   if (ev.type === "tool-call-args") {
+    // Index lookup + single splice: map() would allocate a new object for every
+    // block on every args frame, defeating memoized tool cards downstream.
+    const i = lastIndexOfTool(turns, ev.callId);
+    if (i < 0) return turns;
     const { list, turn } = ensureAssistant(turns);
-    turn.blocks = turn.blocks.map((b) =>
-      b.kind === "tool" && b.callId === ev.callId ? { ...b, input: parsePartialArgs(ev.argsText, b.input) } : b
-    );
+    const b = turn.blocks[i] as ToolBlock;
+    const input = parsePartialArgs(ev.argsText, b.input);
+    if (input === b.input) return turns;
+    turn.blocks[i] = { ...b, input };
     return list;
   }
 
   if (ev.type === "tool-call-completed") {
+    const i = lastIndexOfTool(turns, ev.callId);
+    if (i < 0) return turns;
     const { list, turn } = ensureAssistant(turns);
-    turn.blocks = turn.blocks.map((b) => {
-      if (b.kind !== "tool" || b.callId !== ev.callId) return b;
-      // Never reopen a settled tool if a late/duplicate completion races in.
-      if (b.status !== "running" && b.status === ev.status) {
-        return {
-          ...b,
-          result: ev.result ?? b.result,
-          diff: ev.diff ?? b.diff,
-          startLine: ev.startLine ?? b.startLine,
-          endLine: ev.endLine ?? b.endLine,
-        };
-      }
-      return {
-        ...b,
-        status: ev.status,
-        result: ev.result,
-        diff: ev.diff,
-        startLine: ev.startLine,
-        endLine: ev.endLine,
-      };
-    });
+    const b = turn.blocks[i] as ToolBlock;
+    // Never reopen a settled tool if a late/duplicate completion races in.
+    turn.blocks[i] =
+      b.status !== "running" && b.status === ev.status
+        ? {
+            ...b,
+            result: ev.result ?? b.result,
+            diff: ev.diff ?? b.diff,
+            startLine: ev.startLine ?? b.startLine,
+            endLine: ev.endLine ?? b.endLine,
+          }
+        : {
+            ...b,
+            status: ev.status,
+            result: ev.result,
+            diff: ev.diff,
+            startLine: ev.startLine,
+            endLine: ev.endLine,
+          };
     return list;
   }
 
@@ -399,16 +431,16 @@ export function applyEvent(turns: Turn[], ev: AgentEvent): Turn[] {
   }
 
   if (ev.type === "subagent-event") {
+    const i = lastIndexOfTool(turns, ev.callId);
+    if (i < 0) return turns;
+    const child = ev.event;
+    if (child.type === "run-result") return turns; // summary lands in tool result
     const { list, turn } = ensureAssistant(turns);
-    turn.blocks = turn.blocks.map((b) => {
-      if (b.kind !== "tool" || b.callId !== ev.callId) return b;
-      const child = ev.event;
-      const next = { ...b };
-      if (child.type === "run-status") next.subStatus = child.status;
-      else if (child.type === "run-result") {/* final summary lands in tool result */}
-      else next.subBlocks = applyToBlocks(b.subBlocks ?? [], child);
-      return next;
-    });
+    const b = turn.blocks[i] as ToolBlock;
+    turn.blocks[i] =
+      child.type === "run-status"
+        ? { ...b, subStatus: child.status }
+        : { ...b, subBlocks: applyToBlocks(b.subBlocks ?? [], child) };
     return list;
   }
 
