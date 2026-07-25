@@ -143,20 +143,20 @@ export const MODEL_CATALOG: ModelDef[] = [
 	{ id: "gpt-5.3-codex", name: "GPT-5.3 Codex", kind: ["openai", "codex"], options: [effort("high", ["none", "low", "medium", "high", "xhigh"]), ctx(["128k", "256k", "400k"], "400k")] },
 	// Anthropic — IDs match Claude API (dateless aliases). Fable is the top tier;
 	// Opus 5 is the coding flagship. Adaptive thinking; effort low→max.
-	// Fable 5: thinking always on (disabled unsupported). 1M ctx native.
-	{ id: "claude-fable-5", name: "Claude Fable 5", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["1m"], "1m")] },
-	// Opus 5: thinking on by default; disabled only at effort ≤ high. 1M only.
-	{ id: "claude-opus-5", name: "Claude Opus 5", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["1m"], "1m")] },
-	// Sonnet 5: adaptive; disabled allowed. 1M ctx.
-	{ id: "claude-sonnet-5", name: "Claude Sonnet 5", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["1m"], "1m")] },
+	// Fable 5: thinking always on (disabled unsupported). 1M ctx native, 300k selectable.
+	{ id: "claude-fable-5", name: "Fable 5", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["300k", "1m"], "1m")] },
+	// Opus 5: thinking on by default; disabled only at effort ≤ high. 1M native, 300k selectable.
+	{ id: "claude-opus-5", name: "Opus 5", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["300k", "1m"], "1m")] },
+	// Sonnet 5: adaptive; disabled allowed. 1M native, 300k selectable.
+	{ id: "claude-sonnet-5", name: "Sonnet 5", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["300k", "1m"], "1m")] },
 	// Opus 4.8/4.7: adaptive only (manual budget → 400).
-	{ id: "claude-opus-4-8", name: "Claude Opus 4.8", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["200k", "1m"], "1m")] },
-	{ id: "claude-opus-4-7", name: "Claude Opus 4.7", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["200k", "1m"], "200k")] },
+	{ id: "claude-opus-4-8", name: "Opus 4.8", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["300k", "1m"], "1m")] },
+	{ id: "claude-opus-4-7", name: "Opus 4.7", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["200k", "1m"], "200k")] },
 	// Sonnet 4.6: adaptive recommended; budget_tokens deprecated but accepted.
-	{ id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", kind: ["anthropic", "claude-code"], options: [thinking("adaptive"), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["200k", "1m"], "1m")] },
+	{ id: "claude-sonnet-4-6", name: "Sonnet 4.6", kind: ["anthropic", "claude-code"], options: [thinking("adaptive"), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["200k", "1m"], "1m")] },
 	// Haiku 4.5 — API alias `claude-haiku-4-5` → dated `claude-haiku-4-5-20251001`.
 	// Manual extended thinking only (no adaptive). 200k ctx.
-	{ id: "claude-haiku-4-5", name: "Claude Haiku 4.5", kind: ["anthropic", "claude-code"], options: [thinking("disabled", ["disabled", "enabled"]), ctx(["200k"], "200k")] },
+	{ id: "claude-haiku-4-5", name: "Haiku 4.5", kind: ["anthropic", "claude-code"], options: [thinking("disabled", ["disabled", "enabled"]), ctx(["200k"], "200k")] },
 	// Google Gemini — Gemini 3 is current; served via OpenAI-compatible endpoint,
 	// which maps reasoning_effort to the thinking budget. 1M context.
 	{ id: "gemini-3-pro-preview", name: "Gemini 3 Pro", kind: "google", options: [effort("high", ["low", "medium", "high"]), ctx(["1m"], "1m")] },
@@ -171,8 +171,8 @@ export const MODEL_CATALOG: ModelDef[] = [
 	{ id: "gemini-3.5-flash-extra-low", name: "Gemini 3.5 Flash (Low)", kind: "antigravity", enabled: true },
 	{ id: "gemini-pro-agent", name: "Gemini 3.1 Pro (High)", kind: "antigravity", enabled: true },
 	{ id: "gemini-3.1-pro-low", name: "Gemini 3.1 Pro (Low)", kind: "antigravity", enabled: true },
-	{ id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6 (Thinking)", kind: "antigravity", enabled: true },
-	{ id: "claude-opus-4-6-thinking", name: "Claude Opus 4.6 (Thinking)", kind: "antigravity", enabled: true },
+	{ id: "claude-sonnet-4-6", name: "Sonnet 4.6 (Thinking)", kind: "antigravity", enabled: true },
+	{ id: "claude-opus-4-6-thinking", name: "Opus 4.6 (Thinking)", kind: "antigravity", enabled: true },
 	{ id: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)", kind: "antigravity", enabled: true },
 	{ id: "gemini-3-flash", name: "Gemini 3 Flash", kind: "antigravity", enabled: true },
 
