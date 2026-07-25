@@ -17,6 +17,7 @@ import {
   pushShellOutput,
   getShellSession,
   disposeShellSession,
+  detachShellSession,
   type BgShell,
   type ShellNotify,
 } from "./shared";
@@ -81,13 +82,15 @@ function wrapCommand(command: string, cd: string): string {
       `${cdBlock}` +
       `$__oc_ok = $false; $__oc_code = 1; ` +
       `try { ` +
+      `$ErrorActionPreference = 'Stop'; ` +
       `$__oc_cmd = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${b64}')); ` +
       `Invoke-Expression -Command $__oc_cmd; ` +
       `if ($?) { $__oc_ok = $true; $__oc_code = 0 } ` +
       `elseif ($null -ne $LASTEXITCODE -and "$LASTEXITCODE" -ne '') { $__oc_code = [int]$LASTEXITCODE } ` +
       `else { $__oc_code = 1 } ` +
       `} catch { ` +
-      `[Console]::Error.WriteLine($_.Exception.Message); $__oc_ok = $false; $__oc_code = 1 ` +
+      `[Console]::Error.WriteLine($_ | Out-String); $__oc_ok = $false; ` +
+      `$__oc_code = if ($null -ne $LASTEXITCODE -and "$LASTEXITCODE" -ne '') { [int]$LASTEXITCODE } else { 1 } ` +
       `} finally { ` +
       `if ($__oc_pop) { Pop-Location -ErrorAction SilentlyContinue }; ` +
       `if ($__oc_ok) { [Console]::Out.WriteLine("${SENTINEL}:0") } ` +
@@ -264,15 +267,10 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
       sh.done = true;
       sh.exitCode = sh.exitCode ?? 124;
       killSession();
-    } else if (!sh.done && waitMs > 0) {
-      // Timed out with no sentinel: do NOT leave a hung command poisoning the
-      // session — kill and respawn so the next Shell call is clean.
-      sh.output += `\n(timeout after ${waitMs}ms — session reset; re-run with a shorter command or block_until_ms=0 to background)`;
-      sh.done = true;
-      sh.exitCode = sh.exitCode ?? 124;
-      killSession();
-    } else if (!sh.done && waitMs === 0) {
-      // Immediate background: keep pumping via interval until done/timeout later.
+    } else if (!sh.done) {
+      // Foreground expiry is not command failure. Keep capturing delayed stderr
+      // (including endpoint-security diagnostics) and let AwaitShell observe it.
+      detachShellSession(sessionKey, session);
       const bgPump = setInterval(() => {
         try {
           sh.pump?.();
@@ -281,8 +279,22 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
         }
         if (sh.done) clearInterval(bgPump);
       }, 100);
-      // Hard stop background pump after 10 min.
-      setTimeout(() => clearInterval(bgPump), 600_000).unref?.();
+      // A genuinely stuck command remains observable without poisoning the
+      // queue forever. Reset only after the background lifetime expires.
+      setTimeout(() => {
+        if (!sh.done) {
+          sh.output += "\n(background limit reached after 10m — shell session reset)";
+          sh.done = true;
+          sh.exitCode = sh.exitCode ?? 124;
+          try {
+            if (isWin) session.proc.kill();
+            else session.proc.kill("SIGKILL");
+          } catch {
+            /* ignore */
+          }
+        }
+        clearInterval(bgPump);
+      }, 600_000).unref?.();
     }
 
     // Strip the sentinel line from the rendered body.

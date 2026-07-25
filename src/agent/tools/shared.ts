@@ -451,11 +451,13 @@ export function getShellSession(key: string, cwd: string): ShellSession {
   proc.stderr?.on("data", (d) => {
     try { s!.buffer += d.toString(); } catch { /* ignore */ }
   });
-  proc.on("error", () => {
-    /* keep buffer; next getShellSession recreates */
+  proc.on("error", (error) => {
+    s!.buffer += `\n(shell process error: ${error.message})`;
   });
-  proc.on("exit", () => {
-    /* session is dead; next command will respawn */
+  proc.on("exit", (code, signal) => {
+    if (code !== 0 || signal) {
+      s!.buffer += `\n(shell process exited${code == null ? "" : ` with code ${code}`}${signal ? ` from signal ${signal}` : ""})`;
+    }
   });
   // Prevent unhandled 'error' on stdin from crashing the extension host.
   proc.stdin?.on("error", () => { /* ignore broken pipe */ });
@@ -473,6 +475,11 @@ export function disposeShellSession(key: string): void {
     } catch { /* ignore */ }
     shellSessions.delete(key);
   }
+}
+
+/** Detach a busy session so later commands get a fresh shell while it finishes. */
+export function detachShellSession(key: string, session: ShellSession): void {
+  if (shellSessions.get(key) === session) shellSessions.delete(key);
 }
 
 /**
