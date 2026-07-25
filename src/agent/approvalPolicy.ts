@@ -68,6 +68,7 @@ const PATH_INPUTS: Record<string, string[]> = {
 	Write: ["path"],
 	Delete: ["path"],
 	EditNotebook: ["target_notebook"],
+	Shell: ["working_directory"],
 };
 
 /** True when a file path lands outside the workspace root. */
@@ -130,7 +131,13 @@ export function matchPattern(pattern: string, subject: string, prefixOk: boolean
 		// Also try matching the basename so "*.md" works without "**/".
 		const base = s.split("/").pop() ?? s;
 		const re = new RegExp(`^(?:${rx})$`, "i");
-		return re.test(s) || re.test(base);
+		if (re.test(s) || re.test(base)) return true;
+		// `dir/**` should also allow the directory itself (ListDir on that folder).
+		if (p.endsWith("/**")) {
+			const dir = p.slice(0, -3).replace(/\\/g, "/").toLowerCase();
+			if (dir && (s === dir || s.startsWith(dir + "/"))) return true;
+		}
+		return false;
 	}
 	const pl = p.toLowerCase();
 	const sl = s.toLowerCase();

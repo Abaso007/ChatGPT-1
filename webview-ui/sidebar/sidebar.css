@@ -569,6 +569,7 @@ body {
 .badge-web { background: var(--accent-weak); border-color: var(--accent-line); color: var(--accent); }
 .badge-plan { background: var(--warn-weak); border-color: var(--warn-line); color: var(--warn); }
 .badge-agent { background: var(--purple-weak); border-color: color-mix(in srgb, var(--purple) 40%, transparent); color: var(--purple); }
+.badge-ask { background: var(--warn-weak); border-color: var(--warn-line); color: var(--warn); }
 
 /* Todo list */
 .todo-card { padding: 0; }
@@ -687,6 +688,8 @@ body {
 .subagent-card-main { display: flex; align-items: center; gap: var(--sp-3); }
 .subagent-card-subtitle { padding: var(--sp-2) 0 0 28px; font-size: 11px; font-weight: 400; color: var(--fg-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .subagent-card:hover { border-color: var(--line); border-left-color: var(--purple); background: var(--purple-weak); transform: translateX(1px); }
+.subagent-card.needs-approval { border-left-color: var(--warn); }
+.subagent-approvals { display: flex; flex-direction: column; gap: var(--sp-2); margin: 0 0 var(--sp-3); }
 .subagent-card .ticon { display: inline-flex; color: var(--purple); flex: 0 0 auto; }
 .subagent-card .sub-spacer { flex: 1; }
 .subagent-card .sub-steps { font-size: 10.5px; font-weight: 500; color: var(--fg-faint); }

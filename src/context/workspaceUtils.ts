@@ -108,6 +108,7 @@ export function normalizeToolPaths(toolName: string, input: any, root = getWorks
 		SemanticSearch: ["target_directories"], StrReplace: ["path"], Write: ["path"],
 		Delete: ["path"], EditNotebook: ["target_notebook"], ReadLints: ["paths"],
 		Task: ["file_attachments"], FetchMcpResource: ["downloadPath"],
+		Shell: ["working_directory"],
 	};
 	const out = { ...input };
 	for (const key of keys[toolName] ?? []) {
@@ -118,18 +119,15 @@ export function normalizeToolPaths(toolName: string, input: any, root = getWorks
 	return out;
 }
 
+/**
+ * Resolve a tool/user path to an absolute filesystem path.
+ * Outside-workspace paths are allowed here — the approval gate
+ * (`actionTypeForCall` → "outside") is the security boundary.
+ */
 export function safePath(rel: string): string {
 	const root = getWorkspaceRoot();
 	const s = normalizePathInput(rel);
 	if (!s) throw new Error("empty path");
 	const abs = path.isAbsolute(s) ? s : path.join(root, s);
-	const norm = path.resolve(abs);
-	const ws = path.resolve(root);
-	// Case-insensitive root check on Windows (C:\ vs c:\).
-	const normKey = process.platform === "win32" ? norm.toLowerCase() : norm;
-	const wsKey = process.platform === "win32" ? ws.toLowerCase() : ws;
-	if (normKey !== wsKey && !normKey.startsWith(wsKey + path.sep)) {
-		throw new Error(`path outside workspace: ${rel}`);
-	}
-	return norm;
+	return path.resolve(abs);
 }

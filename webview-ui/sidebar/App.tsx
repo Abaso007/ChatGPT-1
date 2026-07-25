@@ -237,7 +237,12 @@ function ExploringSection({
         <div className="explore-body">
           {tools.map((t, i) => (
             <div className="block-group" key={t.callId || i}>
-              <ToolCard block={t} onImplement={onImplement} onOpenSubagent={onOpenSubagent} />
+              <ToolCard
+                block={t}
+                onImplement={onImplement}
+                onOpenSubagent={onOpenSubagent}
+                awaitingApproval={!!(t.callId && approvals?.[t.callId])}
+              />
               {t.callId && approvals?.[t.callId] && <ApprovalCard request={approvals[t.callId]} inline />}
             </div>
           ))}
@@ -425,12 +430,45 @@ function PersonaSelect({
   );
 }
 
-function SubagentChat({ block, onBack }: { block: import("./types").ToolBlock; onBack: () => void }) {
+/** Approvals whose callId belongs to a tool inside this Task block. */
+function approvalsForSubagent(block: ToolBlock, approvals?: Record<string, ApprovalRequestInfo>): ApprovalRequestInfo[] {
+  if (!approvals) return [];
+  const ids = new Set(
+    (block.subBlocks ?? []).filter((b): b is ToolBlock => b.kind === "tool").map((b) => b.callId),
+  );
+  return Object.values(approvals).filter((r) => r.callId && ids.has(r.callId));
+}
+
+/** Map nested tool callId → parent Task callId. */
+function parentTaskCallId(turns: Turn[], nestedCallId: string): string | undefined {
+  for (const t of turns) {
+    if (t.role !== "assistant") continue;
+    for (const b of t.blocks) {
+      if (b.kind !== "tool" || (b.name !== "Task" && b.name !== "task")) continue;
+      for (const sb of b.subBlocks ?? []) {
+        if (sb.kind === "tool" && sb.callId === nestedCallId) return b.callId;
+      }
+    }
+  }
+  return undefined;
+}
+
+function SubagentChat({
+  block,
+  onBack,
+  approvals,
+}: {
+  block: import("./types").ToolBlock;
+  onBack: () => void;
+  approvals?: Record<string, ApprovalRequestInfo>;
+}) {
   const subDone = block.subStatus === "finished" || block.subStatus === "cancelled" || block.subStatus === "error";
   const running = !subDone && (block.status === "running" || !!block.subStatus || (block.subBlocks?.length ?? 0) > 0);
   const sub = block.subBlocks ?? [];
   const taskPrompt = String(block.input?.prompt || "").trim();
   const [promptOpen, setPromptOpen] = React.useState(false);
+  const pinnedApprovals = React.useMemo(() => approvalsForSubagent(block, approvals), [block, approvals]);
+
   return (
     <div className="subagent-view">
       <div className="subagent-view-head">
@@ -444,6 +482,13 @@ function SubagentChat({ block, onBack }: { block: import("./types").ToolBlock; o
           </button>
         )}
       </div>
+      {pinnedApprovals.length > 0 && (
+        <div className="subagent-approvals">
+          {pinnedApprovals.map((r) => (
+            <ApprovalCard key={r.requestId} request={r} />
+          ))}
+        </div>
+      )}
       <div className="msg user subagent-task-msg">
         <div className="role"><Icon name="task" /> Task</div>
         {taskPrompt ? (
@@ -532,7 +577,7 @@ function ApprovalCard({ request, inline }: { request: ApprovalRequestInfo; inlin
     post({ type: "resolveApproval", requestId: request.requestId, ...msg });
   const label = ACTION_LABEL[request.actionType].toLowerCase();
   return (
-    <div className={"approval-card" + (inline ? " inline" : "")}>
+    <div className={"approval-card" + (inline ? " inline" : "")} onClick={(e) => e.stopPropagation()}>
       <div className="ap-head">
         <Icon name="tools" size={14} />
         <span className="ap-title">{ACTION_LABEL[request.actionType]} needs approval</span>
@@ -1267,6 +1312,17 @@ export function App() {
     for (const r of activeApprovals) if (r.callId) m[r.callId] = r;
     return m;
   }, [activeApprovals]);
+  // Nested tool approvals → parent Task callId (shown on the subagent card).
+  const approvalsByTask = React.useMemo(() => {
+    const m: Record<string, ApprovalRequestInfo[]> = {};
+    for (const r of activeApprovals) {
+      if (!r.callId) continue;
+      const parent = parentTaskCallId(turns, r.callId);
+      if (!parent) continue;
+      (m[parent] ??= []).push(r);
+    }
+    return m;
+  }, [activeApprovals, turns]);
   const orphanApprovals = activeApprovals.filter((r) => !r.callId);
   // If the sub-tab's block vanished (new conversation loaded), drop back to parent.
   React.useEffect(() => {
@@ -1401,7 +1457,7 @@ export function App() {
 
       <div className="chat-messages" ref={scrollRef} onScroll={onScroll}>
         {subBlock ? (
-          <SubagentChat block={subBlock} onBack={() => setSubTab(null)} />
+          <SubagentChat block={subBlock} onBack={() => setSubTab(null)} approvals={approvalsByCall} />
         ) : !hasProviders ? (
           <div className="setup-screen">
             <img className="app-logo" src={document.getElementById("root")?.dataset.icon} alt="OpenCursor" />
@@ -1531,8 +1587,16 @@ export function App() {
                           <div className="block-group" key={bi}><MaxStepsCard block={b} running={isRunning} /></div>
                         ) : (
                           <div className="block-group" key={bi}>
-                            <ToolCard block={b} onImplement={onImplement} onOpenSubagent={onOpenSubagent} />
+                            <ToolCard
+                              block={b}
+                              onImplement={onImplement}
+                              onOpenSubagent={onOpenSubagent}
+                              awaitingApproval={!!(b.callId && approvalsByTask[b.callId]?.length)}
+                            />
                             {b.callId && approvalsByCall[b.callId] && <ApprovalCard request={approvalsByCall[b.callId]} inline />}
+                            {b.callId && approvalsByTask[b.callId]?.map((r) => (
+                              <ApprovalCard key={r.requestId} request={r} />
+                            ))}
                           </div>
                         )
                       ); })()}

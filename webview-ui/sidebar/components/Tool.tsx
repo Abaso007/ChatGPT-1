@@ -213,23 +213,28 @@ function TodoList({ block }: { block: ToolBlock }) {
   );
 }
 
-function SubagentCard({ block, onOpen }: { block: ToolBlock; onOpen?: (callId: string) => void }) {
+function SubagentCard({ block, onOpen, awaitingApproval }: { block: ToolBlock; onOpen?: (callId: string) => void; awaitingApproval?: boolean }) {
   const i = block.input || {};
   // Background subagents complete the parent tool-call immediately while they keep
   // streaming, so drive "running" off the subagent's own status, not the tool status.
   const subDone = block.subStatus === "finished" || block.subStatus === "cancelled" || block.subStatus === "error";
   const running = !subDone && (block.status === "running" || !!block.subStatus || (block.subBlocks?.length ?? 0) > 0);
   const steps = (block.subBlocks ?? []).filter((b) => b.kind === "tool").length;
-  const subtitle = running ? subagentActivity(block.subBlocks) : undefined;
+  const subtitle = awaitingApproval
+    ? "Waiting for approval…"
+    : running
+      ? subagentActivity(block.subBlocks)
+      : undefined;
 
   return (
-    <div className="subagent-card" onClick={() => onOpen?.(block.callId)} role="button" title="Open subagent">
+    <div className={"subagent-card" + (awaitingApproval ? " needs-approval" : "")} onClick={() => onOpen?.(block.callId)} role="button" title="Open subagent">
       <div className="subagent-card-main">
         <span className="ticon"><Icon name="task" /></span>
         <span className="label">{i.description || "Subagent"}</span>
         <span className="sub-spacer" />
         <span className="sub-steps">{running ? `${steps} steps...` : `${steps} steps`}</span>
         <span className="badge badge-agent">{isReadonlySubagent(i) ? "Explore" : "Agent"}</span>
+        {awaitingApproval ? <span className="badge badge-ask">Approve</span> : null}
         {running ? <span className="spinner" /> : <StatusIcon status={block.subStatus === "error" ? "error" : "completed"} />}
         <Icon name="chevR" size={14} className="sub-open-chev" />
       </div>
@@ -615,12 +620,12 @@ function editPreview(name: string, i: any): string {
   return "";
 }
 
-function ToolCardInner({ block, onImplement, onOpenSubagent }: { block: ToolBlock; onImplement?: (path: string) => void; onOpenSubagent?: (callId: string) => void }) {
+function ToolCardInner({ block, onImplement, onOpenSubagent, awaitingApproval }: { block: ToolBlock; onImplement?: (path: string) => void; onOpenSubagent?: (callId: string) => void; awaitingApproval?: boolean }) {
   if (block.name === "write_plan" || block.name === "WritePlan") return <PlanCard block={block} onImplement={onImplement} />;
   if (block.name === "ask_question" || block.name === "AskQuestion") return <QuestionCard block={block} />;
   if (block.name === "read_file" || block.name === "Read") return <ReadLine block={block} />;
   if (block.name === "todo_write" || block.name === "todo_read" || block.name === "TodoWrite" || block.name === "TodoRead") return <TodoList block={block} />;
-  if (block.name === "task" || block.name === "Task") return <SubagentCard block={block} onOpen={onOpenSubagent} />;
+  if (block.name === "task" || block.name === "Task") return <SubagentCard block={block} onOpen={onOpenSubagent} awaitingApproval={awaitingApproval} />;
 
   const i = block.input || {};
   const meta = toolMeta(block.name, i);
@@ -709,7 +714,7 @@ function ToolCardInner({ block, onImplement, onOpenSubagent }: { block: ToolBloc
 // immutable once the call settles. Re-render only when this block's own
 // identity/state changes, not on every stream frame elsewhere in the run.
 export const ToolCard = React.memo(ToolCardInner, (a, b) =>
-  a.block === b.block && a.onImplement === b.onImplement && a.onOpenSubagent === b.onOpenSubagent,
+  a.block === b.block && a.onImplement === b.onImplement && a.onOpenSubagent === b.onOpenSubagent && a.awaitingApproval === b.awaitingApproval,
 );
 
 function CopyCommandButton({ command }: { command: string }) {
