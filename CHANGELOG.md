@@ -4,6 +4,24 @@ All notable changes to the "ocursor" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.0.9] - 2026-07-25
+
+### Added
+
+- Opus 5 in the model catalog (flagship); curated Claude 5 aliases (Opus / Sonnet / Fable) stay selectable when `/v1/models` lags
+- Dynamic default `max_tokens` from model capabilities and reasoning effort
+- Adaptive-thinking guards: Opus 5 clamps effort when thinking is disabled; Fable 5 / Mythos reject disable
+
+### Fixed
+
+- Anthropic in-band stream `error` events (overloaded, invalid model, mid-stream rejection) surface instead of empty turns
+- Safety-classifier `refusal` finish reason throws a clear error instead of a silent end
+
+### Changed
+
+- 1M context is native default on Opus 5 / Fable 5 / Sonnet 5 / 4.6+; `context-1m` beta header only on older models that still gate it
+- Fable 5, Opus 5, and Sonnet 5 offer both 300k and 1M context options (1M default); Sonnet 4.6 offers 200k and 1M
+
 ## [0.0.8] - 2026-07-21
 
 ### Fixed
