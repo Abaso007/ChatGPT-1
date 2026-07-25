@@ -1168,23 +1168,6 @@ body {
 .composer .editor .mention:hover .mention-x { visibility: visible; }
 .composer .editor .mention .mention-x:hover { color: var(--vscode-errorForeground, #f14c4c); }
 .composer-bar { display: flex; align-items: center; gap: 5px; margin-top: 7px; flex-wrap: nowrap; min-width: 0; }
-.ctx-pill { padding: 3px 6px 3px 8px; gap: 2px; }
-.ctx-pill .cd, .ctx-pill svg { width: 11px; height: 11px; opacity: .7; }
-.ctx-dropdown { min-width: 96px; padding: 4px; }
-.ctx-dropdown .mode-item {
-  width: 100%;
-  justify-content: space-between;
-  background: none;
-  border: none;
-  color: var(--fg);
-  font: inherit;
-  font-size: 12px;
-  text-align: left;
-  cursor: pointer;
-}
-.ctx-dropdown .mode-item .mi-label { flex: 1 1 auto; }
-.ctx-dropdown .mode-item .mi-check { color: var(--fg-dim); display: inline-flex; }
-.ctx-dropdown .mode-item.active { background: var(--hover); }
 .pill {
   display: inline-flex; align-items: center; gap: var(--sp-2);
   background: transparent; border: 1px solid var(--line-soft);
