@@ -81,33 +81,61 @@ async function doFetch(): Promise<AllModels> {
   const list: ModelDef[] = [];
   const seen = new Set<string>();
 
-  for (const p of enabled) {
-    const key = (await settingsManager.getProviderKey(p.id)) || "";
-    const anthropic = p.kind === "anthropic";
-    if (!key && anthropic) continue;
-    try {
-      const fetched = await listModels(p.baseUrl, key, anthropic);
-      for (const m of fetched) {
-        if (seen.has(m.id)) continue;
-        seen.add(m.id);
-        list.push({ id: m.id, name: featureStore.nameFor(m.id, p.kind), kind: p.kind, options: featureStore.optionsFor(m.id, p.kind), providerId: p.id, providerName: p.name });
+  // All providers + OAuth in parallel (was sequential — multi-provider lag).
+  const [providerBatches, ...oauthBatches] = await Promise.all([
+    Promise.all(
+      enabled.map(async (p) => {
+        const key = (await settingsManager.getProviderKey(p.id)) || "";
+        const anthropic = p.kind === "anthropic";
+        if (!key && anthropic) return [] as { id: string; p: typeof p }[];
+        try {
+          const fetched = await listModels(p.baseUrl, key, anthropic);
+          return fetched.map((m) => ({ id: m.id, p }));
+        } catch {
+          return [] as { id: string; p: typeof p }[];
+        }
+      }),
+    ),
+    ...(["claude-code", "codex", "antigravity"] as oauth.OAuthKind[]).map(async (kind) => {
+      if (!oauth.isConnected(kind)) return { kind, ids: [] as string[] };
+      try {
+        return { kind, ids: await oauth.listOAuthModels(kind) };
+      } catch {
+        return { kind, ids: [] as string[] };
       }
-    } catch {
-      // Skip providers that fail to list (bad key, offline, etc.).
+    }),
+  ]);
+
+  for (const batch of providerBatches) {
+    for (const { id, p } of batch) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      list.push({
+        id,
+        name: featureStore.nameFor(id, p.kind),
+        kind: p.kind,
+        options: featureStore.optionsFor(id, p.kind),
+        providerId: p.id,
+        providerName: p.name,
+      });
     }
   }
 
-  // OAuth account models (Claude Code / Codex / Antigravity) — grouped by account.
-  for (const kind of ["claude-code", "codex", "antigravity"] as oauth.OAuthKind[]) {
-    if (!oauth.isConnected(kind)) continue;
+  for (const { kind, ids } of oauthBatches) {
+    if (!ids.length) continue;
     const label = oauth.OAUTH_LABEL[kind];
     const k = kind === "claude-code" ? "anthropic" : kind === "codex" ? "openai" : "google";
-    let ids: string[] = [];
-    try { ids = await oauth.listOAuthModels(kind); } catch { ids = []; }
     for (const id of ids) {
       if (seen.has(id)) continue;
       seen.add(id);
-      list.push({ id, name: featureStore.nameFor(id, kind), kind: k as ModelDef["kind"], options: featureStore.optionsFor(id, kind), providerId: `oauth:${kind}`, providerName: label });
+      list.push({
+        id,
+        name: featureStore.nameFor(id, kind),
+        kind: k as ModelDef["kind"],
+        options: featureStore.optionsFor(id, kind),
+        providerId: `oauth:${kind}`,
+        providerName: label,
+      });
     }
   }
 

@@ -56,6 +56,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private _modelProvider = new Map<string, string>();
   /** Map model id -> OAuth provider kind that serves it. */
   private _oauthModelKind = new Map<string, oauth.OAuthKind>();
+  /** Last successful provider→ids fetch. Disk-backed so startup paints before network. */
+  private _fetchedCache: { providerId: string; ids: string[] }[] | null = null;
+  private _fetchInflight: Promise<void> | null = null;
+  private static readonly MODELS_CACHE_KEY = "ocursor.modelsFetched.v1";
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -63,6 +67,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     private readonly featureStore: FeatureStore
   ) {
     this._store = new ConversationStore(context);
+    const disk = context.globalState.get<{ fetched: { providerId: string; ids: string[] }[] }>(
+      SidebarProvider.MODELS_CACHE_KEY,
+    );
+    if (disk?.fetched?.length) this._fetchedCache = disk.fetched;
   }
 
   /**
@@ -1094,65 +1102,88 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     return candidates[0];
   }
 
-  private async _handleFetchModels() {
-    const enabled = this._enabledProviders();
-    const fetched = await Promise.all(
-      enabled.map(async (p) => {
-        const apiKey = (await this.settingsManager.getProviderKey(p.id)) || "";
-        const anthropic = p.kind === "anthropic";
-        if (!apiKey && anthropic) return { providerId: p.id, ids: [] };
-        try {
-          const models = await listModels(p.baseUrl, apiKey, anthropic);
-          return { providerId: p.id, ids: models.map((m) => m.id) };
-        } catch {
-          return { providerId: p.id, ids: [] };
-        }
-      })
-    );
-    // Locally-pulled Ollama models — surfaced like llama.cpp, no provider entry.
-    let ollamaIds: string[] = [];
-    try {
-      ollamaIds = (await ollama.listModels()).map((m) => m.name);
-    } catch {
-      ollamaIds = [];
-    }
-    this._ollamaModelIds = new Set(ollamaIds);
-    if (ollamaIds.length) fetched.push({ providerId: "__ollama__", ids: ollamaIds });
-
-    // OAuth account models (Claude Code / Codex) — authenticated via login.
+  /**
+   * Publish a fetched id map to the webview + routing tables.
+   * Rebuilds ModelDef options from featureStore (cheap, no network).
+   */
+  private _publishFetched(fetched: { providerId: string; ids: string[] }[]) {
+    this._ollamaModelIds = new Set(fetched.find((f) => f.providerId === "__ollama__")?.ids ?? []);
     this._oauthModelKind = new Map();
-    for (const kind of ["claude-code", "codex", "antigravity"] as oauth.OAuthKind[]) {
-      if (!oauth.isConnected(kind)) continue;
-      let ids: string[] = [];
-      try {
-        ids = await oauth.listOAuthModels(kind);
-      } catch {
-        ids = [];
-      }
-      // First connected account wins for a shared model id (e.g. claude-sonnet-4-6
-      // is offered by both Claude Code and Antigravity) — route native provider first.
+    for (const { providerId, ids } of fetched) {
+      if (!providerId.startsWith("__oauth__:")) continue;
+      const kind = providerId.slice("__oauth__:".length) as oauth.OAuthKind;
       for (const id of ids) if (!this._oauthModelKind.has(id)) this._oauthModelKind.set(id, kind);
-      if (ids.length) fetched.push({ providerId: `__oauth__:${kind}`, ids });
     }
-
-    // Remember which provider served each fetched id so we route exactly there.
     this._modelProvider = new Map();
     for (const { providerId, ids } of fetched) {
       if (providerId === "__ollama__" || providerId.startsWith("__oauth__:")) continue;
       for (const id of ids) if (!this._modelProvider.has(id)) this._modelProvider.set(id, providerId);
     }
-
     const allIds = fetched.flatMap((f) => f.ids);
     const modelList = this._buildModelList(fetched);
-    // Selected model vanished (e.g. account disabled) or is "auto" (hidden for
-    // now) -> fall back to the first enabled model.
     const settings = this.settingsManager.getSettings();
     if (settings.model === "auto" || (settings.model && !modelList.some((m) => m.id === settings.model))) {
       settings.model = modelList[0]?.id || "";
-      await this.settingsManager.saveSettings(settings);
-      this._view?.webview.postMessage({ type: "modelSelected", model: settings.model });
+      void this.settingsManager.saveSettings(settings).then(() => {
+        this._view?.webview.postMessage({ type: "modelSelected", model: settings.model });
+      });
     }
     this._view?.webview.postMessage({ type: "modelsFetched", models: allIds, modelList });
+  }
+
+  /**
+   * Paint cache immediately (no wait), then always list models from providers.
+   * Cache is startup UX only — never skips a network refresh.
+   */
+  private async _handleFetchModels() {
+    // Instant paint from last session / memory (or catalog-only if cold).
+    this._publishFetched(this._fetchedCache || []);
+
+    // Coalesce concurrent callers onto one in-flight list (still always runs).
+    if (this._fetchInflight) return this._fetchInflight;
+
+    this._fetchInflight = this._networkFetchModels().finally(() => {
+      this._fetchInflight = null;
+    });
+    return this._fetchInflight;
+  }
+
+  private async _networkFetchModels() {
+    const enabled = this._enabledProviders();
+    const [providerFetched, ollamaIds, ...oauthBatches] = await Promise.all([
+      Promise.all(
+        enabled.map(async (p) => {
+          const apiKey = (await this.settingsManager.getProviderKey(p.id)) || "";
+          const anthropic = p.kind === "anthropic";
+          if (!apiKey && anthropic) return { providerId: p.id, ids: [] as string[] };
+          try {
+            const models = await listModels(p.baseUrl, apiKey, anthropic);
+            return { providerId: p.id, ids: models.map((m) => m.id) };
+          } catch {
+            return { providerId: p.id, ids: [] as string[] };
+          }
+        }),
+      ),
+      ollama.listModels().then((ms) => ms.map((m) => m.name)).catch(() => [] as string[]),
+      ...(["claude-code", "codex", "antigravity"] as oauth.OAuthKind[]).map(async (kind) => {
+        if (!oauth.isConnected(kind)) return { kind, ids: [] as string[] };
+        try {
+          return { kind, ids: await oauth.listOAuthModels(kind) };
+        } catch {
+          return { kind, ids: [] as string[] };
+        }
+      }),
+    ]);
+
+    const fetched = [...providerFetched];
+    if (ollamaIds.length) fetched.push({ providerId: "__ollama__", ids: ollamaIds });
+    for (const { kind, ids } of oauthBatches) {
+      if (ids.length) fetched.push({ providerId: `__oauth__:${kind}`, ids });
+    }
+
+    this._fetchedCache = fetched;
+    void this.context.globalState.update(SidebarProvider.MODELS_CACHE_KEY, { fetched });
+    this._publishFetched(fetched);
   }
 
   private async _browseAttachments() {
