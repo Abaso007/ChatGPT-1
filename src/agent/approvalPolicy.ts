@@ -61,7 +61,11 @@ const PATH_TOOLS = new Set(["Read", "StrReplace", "Write", "Delete", "EditNotebo
 export function isOutsideWorkspace(path: string, root: string | undefined): boolean {
 	if (!root || !path) return false;
 	const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-	const p = norm(path);
+	let p = norm(path);
+	// `/workspace` is the model-facing workspace alias; Windows has no such root.
+	if (process.platform === "win32" && (p === "/workspace" || p.startsWith("/workspace/"))) {
+		p = norm(root) + p.slice("/workspace".length);
+	}
 	// Relative paths resolve inside the workspace.
 	if (!/^([a-z]:\/|\/)/.test(p)) return false;
 	return !(p === norm(root) || p.startsWith(norm(root) + "/"));

@@ -23,7 +23,7 @@ import { DEFAULT_APPROVAL, evaluateApproval, actionTypeForCall, subjectFor, type
 import { stripModelScope, suggestPattern } from "./sidebar/approvalSuggest";
 import type { PendingApproval, RunSession } from "./sidebar/session";
 import { runHooks, runBlockingHooks } from "../integrations/hooksRunner";
-import { getWorkspaceRoot } from "../context/workspaceUtils";
+import { getWorkspaceRoot, safePath } from "../context/workspaceUtils";
 import { allPersonas, getPersona } from "../agent/personas";
 import { pendingChanges, computeHunks } from "../stores/pendingChanges";
 import { applyEvent, closeTrailingThinking, forceSettleOpenWork, parseMentionTokens, renderMentionTokens, type AgentEvent as SharedAgentEvent, type Turn } from "../shared/turns";
@@ -569,10 +569,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       return;
     }
     try {
-      const folders = vscode.workspace.workspaceFolders;
-      const base = folders && folders.length > 0 ? folders[0].uri : undefined;
-      const isAbsolute = /^([a-zA-Z]:[\\/]|\/)/.test(relPath);
-      const uri = isAbsolute ? vscode.Uri.file(relPath) : base ? vscode.Uri.joinPath(base, relPath) : vscode.Uri.file(relPath);
+      // Use the same resolver as tools so model-facing `/workspace/...` paths
+      // become this workspace on Windows instead of the nonexistent C:\workspace.
+      const uri = vscode.Uri.file(safePath(relPath));
       // Race open so a missing/network path cannot hang the extension host forever.
       const doc = await Promise.race([
         vscode.workspace.openTextDocument(uri),
@@ -590,6 +589,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
       }
     } catch (err: any) {
+      logError("ui.open-file", err, { path: relPath });
       vscode.window.showErrorMessage(`OpenCursor: Could not open ${relPath}: ${err?.message || err}`);
     }
   }

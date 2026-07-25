@@ -67,6 +67,12 @@ export function normalizePathInput(rel: string): string {
 	}
 	// Model sometimes escapes spaces as `\ ` (unix-style).
 	s = s.replace(/\\ /g, " ");
+	// Models commonly inherit the Linux sandbox root from training/tool examples.
+	// On Windows, `/workspace[/…]` means this VS Code workspace, not `C:\workspace`.
+	if (process.platform === "win32" && /^[/\\]workspace(?:[/\\]|$)/i.test(s)) {
+		const suffix = s.replace(/^[/\\]workspace(?:[/\\]?)/i, "");
+		s = path.join(getWorkspaceRoot(), suffix);
+	}
 	// Collapse only internal runs of spaces that are clearly accidental? Keep
 	// real spaces in folder names — do not collapse.
 	// Normalize separators; path.resolve will also fix mixed ones.
