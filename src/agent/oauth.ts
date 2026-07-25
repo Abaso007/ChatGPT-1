@@ -71,7 +71,7 @@ const CODEX = {
   path: "/auth/callback",
   scope: "openid profile email offline_access api.connectors.read api.connectors.invoke",
   originator: "codex_cli_rs",
-  cliVersion: "0.125.0",
+  cliVersion: "0.136.0",
   responsesUrl: "https://chatgpt.com/backend-api/codex/responses",
   modelsUrl: "https://chatgpt.com/backend-api/codex/models",
   fallbackModels: ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"],
@@ -774,7 +774,7 @@ export async function listOAuthModels(kind: OAuthKind): Promise<string[]> {
   if (!acc) return [...CODEX.fallbackModels];
   try {
     const fresh = await validAccount(acc.id);
-    const r = await fetch(`${CODEX.modelsUrl}?client_version=ocursor`, {
+    const r = await fetch(`${CODEX.modelsUrl}?client_version=${encodeURIComponent(CODEX.cliVersion)}`, {
       headers: {
         authorization: `Bearer ${fresh.accessToken}`,
         accept: "application/json",
