@@ -67,9 +67,8 @@ export function normalizePathInput(rel: string): string {
 	}
 	// Model sometimes escapes spaces as `\ ` (unix-style).
 	s = s.replace(/\\ /g, " ");
-	// Models commonly inherit the Linux sandbox root from training/tool examples.
-	// On Windows, `/workspace[/…]` means this VS Code workspace, not `C:\workspace`.
-	if (process.platform === "win32" && /^[/\\]workspace(?:[/\\]|$)/i.test(s)) {
+	// `/workspace` is the portable model-facing alias on every host OS.
+	if (/^[/\\]workspace(?:[/\\]|$)/i.test(s)) {
 		const suffix = s.replace(/^[/\\]workspace(?:[/\\]?)/i, "");
 		s = path.join(getWorkspaceRoot(), suffix);
 	}
@@ -89,6 +88,36 @@ export function normalizePathInput(rel: string): string {
  * separators. Does not shell-quote — callers that inject into a shell must
  * quote the result (see shell.ts quotePath).
  */
+/** Convert workspace paths to the portable model/tool representation. */
+export function toWorkspacePath(input: string, root = getWorkspaceRoot()): string {
+	const s = normalizePathInput(input);
+	if (!s) return s;
+	const ws = path.resolve(root);
+	const resolved = path.resolve(path.isAbsolute(s) ? s : path.join(ws, s));
+	const relative = path.relative(ws, resolved);
+	if (relative === "") return "/workspace";
+	if (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
+		return `/workspace/${relative.split(path.sep).join("/")}`;
+	}
+	return resolved;
+}
+
+export function normalizeToolPaths(toolName: string, input: any, root = getWorkspaceRoot()): any {
+	const keys: Record<string, string[]> = {
+		Read: ["path"], ListDir: ["path"], Glob: ["target_directory"], Grep: ["path"],
+		SemanticSearch: ["target_directories"], StrReplace: ["path"], Write: ["path"],
+		Delete: ["path"], EditNotebook: ["target_notebook"], ReadLints: ["paths"],
+		Task: ["file_attachments"], FetchMcpResource: ["downloadPath"],
+	};
+	const out = { ...input };
+	for (const key of keys[toolName] ?? []) {
+		const value = out[key];
+		if (Array.isArray(value)) out[key] = value.map((item) => toWorkspacePath(String(item), root));
+		else if (value != null && value !== "") out[key] = toWorkspacePath(String(value), root);
+	}
+	return out;
+}
+
 export function safePath(rel: string): string {
 	const root = getWorkspaceRoot();
 	const s = normalizePathInput(rel);

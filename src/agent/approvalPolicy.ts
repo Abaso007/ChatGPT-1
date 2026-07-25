@@ -18,6 +18,9 @@
  * Deny list beats allow list beats mode.
  */
 
+import * as nodePath from "path";
+import { normalizePathInput, toWorkspacePath } from "../context/workspaceUtils";
+
 export type ApprovalMode = "allow" | "ask" | "review" | "deny";
 
 export interface ApprovalRule {
@@ -54,21 +57,35 @@ export function actionTypeFor(toolName: string): ApprovalActionType | undefined 
 	return undefined;
 }
 
-/** Tools whose `path`-like input can reach outside the workspace. */
-const PATH_TOOLS = new Set(["Read", "StrReplace", "Write", "Delete", "EditNotebook"]);
+/** Path-bearing inputs by tool. Every filesystem traversal must use this map. */
+const PATH_INPUTS: Record<string, string[]> = {
+	Read: ["path"],
+	ListDir: ["path"],
+	Glob: ["target_directory"],
+	Grep: ["path"],
+	SemanticSearch: ["target_directories"],
+	StrReplace: ["path"],
+	Write: ["path"],
+	Delete: ["path"],
+	EditNotebook: ["target_notebook"],
+};
 
 /** True when a file path lands outside the workspace root. */
 export function isOutsideWorkspace(path: string, root: string | undefined): boolean {
 	if (!root || !path) return false;
-	const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-	let p = norm(path);
-	// `/workspace` is the model-facing workspace alias; Windows has no such root.
-	if (process.platform === "win32" && (p === "/workspace" || p.startsWith("/workspace/"))) {
-		p = norm(root) + p.slice("/workspace".length);
-	}
-	// Relative paths resolve inside the workspace.
-	if (!/^([a-z]:\/|\/)/.test(p)) return false;
-	return !(p === norm(root) || p.startsWith(norm(root) + "/"));
+	const candidate = normalizePathInput(path);
+	const resolvedRoot = nodePath.resolve(root);
+	const resolvedPath = nodePath.resolve(resolvedRoot, candidate);
+	const relative = nodePath.relative(resolvedRoot, resolvedPath);
+	return relative === ".." || relative.startsWith(`..${nodePath.sep}`) || nodePath.isAbsolute(relative);
+}
+
+function pathsForCall(toolName: string, input: any, root?: string): string[] {
+	return (PATH_INPUTS[toolName] ?? []).flatMap((key) => {
+		const value = input?.[key];
+		const paths = Array.isArray(value) ? value.map(String) : value == null ? [] : [String(value)];
+		return root ? paths.map((item) => toWorkspacePath(item, root)) : paths;
+	});
 }
 
 /**
@@ -76,10 +93,7 @@ export function isOutsideWorkspace(path: string, root: string | undefined): bool
  * workspace escalate to "outside" (covers Read, which is otherwise ungated).
  */
 export function actionTypeForCall(toolName: string, input: any, root: string | undefined): ApprovalActionType | undefined {
-	if (PATH_TOOLS.has(toolName)) {
-		const path = String(input?.path ?? input?.target_notebook ?? "");
-		if (isOutsideWorkspace(path, root)) return "outside";
-	}
+	if (pathsForCall(toolName, input, root).some((path) => isOutsideWorkspace(path, root))) return "outside";
 	return actionTypeFor(toolName);
 }
 
@@ -88,8 +102,8 @@ export function subjectFor(type: ApprovalActionType, toolName: string, input: an
 	switch (type) {
 		case "shell": return String(input?.command ?? "");
 		case "edits":
-		case "delete":
-		case "outside": return String(input?.path ?? input?.target_notebook ?? "");
+		case "delete": return String(input?.path ?? input?.target_notebook ?? "");
+		case "outside": return pathsForCall(toolName, input).join(", ");
 		case "web": return String(input?.url ?? input?.search_term ?? input?.query ?? "");
 		case "mcp": return toolName;
 	}

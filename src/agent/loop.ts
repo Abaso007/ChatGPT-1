@@ -11,7 +11,7 @@ import { streamChat, SamplingParams, ModelParams } from "./provider";
 import type { OAuthKind } from "./oauth";
 import { TOOLS, schemasForMode, toolsForMode, resetTodos, getTodos, disposeShellSession, EDIT_TOOLS, MULTITASK_TOOLS, toolTimeoutMs, withToolTimeout, type AskQuestionItem, type ToolContext } from "./tools";
 import { actionTypeForCall } from "./approvalPolicy";
-import { getWorkspaceRoot } from "../context/workspaceUtils";
+import { getWorkspaceRoot, normalizeToolPaths } from "../context/workspaceUtils";
 import { systemPrompt } from "./prompt";
 import { buildMessages, fitStepsToBudget, splitForCompaction, stepsToTranscript, stepsTokens, type CursorContextBlocks } from "./messages";
 import { economizeHistory, COMPACT_AT_FILL, COMPACT_SOFT_FILL, COMPACT_KEEP_FRAC, isCompactionBoundary } from "./contextEconomy";
@@ -771,7 +771,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			};
 
 			const exec = async (i: number) => {
-				const { call, input, badArgs } = parsed[i];
+				const { call, badArgs } = parsed[i];
+				const input = normalizeToolPaths(call.name, parsed[i].input, getWorkspaceRoot());
 				if (badArgs) {
 					results[i] = {
 						status: "error",
