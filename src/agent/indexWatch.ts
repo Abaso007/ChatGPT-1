@@ -15,6 +15,7 @@ import { upsertFile, removeFile, buildIndex, setIndexingEnabled, warmIndex, isIn
 import { getWorkspaceRoot } from "../context/workspaceUtils";
 import { invalidateScanCache } from "./tools/fileScan";
 import type { FeatureStore } from "../stores/featureStore";
+import { logError } from "../logging";
 
 const DEBOUNCE_MS = 800;
 const pending = new Map<string, "up" | "del">(); // abs path -> action
@@ -49,8 +50,8 @@ async function flush(): Promise<void> {
       try {
         if (action === "del") await removeFile(root, abs);
         else await upsertFile(root, abs);
-      } catch {
-        /* ignore single-file failures */
+      } catch (error) {
+        logError("index.file", error, { action, path: abs });
       }
     }
   } finally {
@@ -88,8 +89,8 @@ export function initIndexWatch(context: vscode.ExtensionContext, store: FeatureS
 
   const root = getWorkspaceRoot();
   void warmIndex(root).then(() => {
-    if (lastEnabled) void buildIndex(root).catch(() => {});
-  });
+    if (lastEnabled) void buildIndex(root).catch((error) => logError("index.build", error, { root }));
+  }).catch((error) => logError("index.warm", error, { root }));
 
   const watcher = vscode.workspace.createFileSystemWatcher("**/*");
   context.subscriptions.push(
@@ -111,7 +112,10 @@ export function initIndexWatch(context: vscode.ExtensionContext, store: FeatureS
       if (on === lastEnabled) return;
       lastEnabled = on;
       setIndexingEnabled(on);
-      if (on) void buildIndex(getWorkspaceRoot()).catch(() => {});
+      if (on) {
+        const root = getWorkspaceRoot();
+        void buildIndex(root).catch((error) => logError("index.enable", error, { root }));
+      }
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
       invalidateScanCache();
@@ -119,7 +123,9 @@ export function initIndexWatch(context: vscode.ExtensionContext, store: FeatureS
       const f = featureStore?.get();
       if (f && f.indexNewFolders === false) return;
       const r = getWorkspaceRoot();
-      void warmIndex(r).then(() => buildIndex(r).catch(() => {}));
+      void warmIndex(r)
+        .then(() => buildIndex(r))
+        .catch((error) => logError("index.workspace-change", error, { root: r }));
     }),
     {
       dispose: () => {

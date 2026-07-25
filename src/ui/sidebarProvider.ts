@@ -32,6 +32,7 @@ import {
   searchFilesAndFolders, searchCommits, searchDocSources, searchTerminals,
   searchRules, searchCode, branchDiffItem, resolveMentions, type MentionItem as HostMentionItem,
 } from "../context/mentions";
+import { getLog, logError } from "../logging";
 
 export class SidebarProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "ocursor.chatView";
@@ -39,10 +40,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   /** One independent agent run per conversation, so chats run concurrently. */
   private _sessions = new Map<string, RunSession>();
   private _currentMode: Mode = "agent";
-  /** Shared debug/log output channel (View → Output → "OpenCursor"). Lazy: created on first use, not at module load. */
-  private static _log?: vscode.OutputChannel;
+  /** Shared debug/log output channel (View → Output → "OpenCursor"). */
   public static get log(): vscode.OutputChannel {
-    return (this._log ??= vscode.window.createOutputChannel("OpenCursor"));
+    return getLog();
   }
   private _store: ConversationStore;
   private _activeId?: string;
@@ -1489,8 +1489,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           emit({ type: "shell-notify", message: `Loading ${local.name}…` });
           try {
             await ensureLoaded(local, features.llamacppConfig);
-          } catch (e: any) {
-            emit({ type: "error", message: `Failed to load ${local.name}: ${e?.message || e}` });
+          } catch (e: unknown) {
+            logError("local-model.load", e, { model: local.id });
+            emit({ type: "error", message: `Failed to load ${local.name}: ${e instanceof Error ? e.message : String(e)}` });
             emit({ type: "run-status", status: "error" });
             return; // `finally` clears the session + persists.
           }
@@ -1509,7 +1510,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
               this._sendConversations();
             }
           })
-          .catch((e) => SidebarProvider.log.appendLine(`[title] failed: ${e?.message || e}`));
+          .catch((error) => logError("title.generate", error, { conversationId: convId }));
       }
 
       await runAgent({
@@ -1556,14 +1557,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         signal: session.abort.signal,
         emit,
       });
-    } catch (err: any) {
-      SidebarProvider.log.appendLine(`[${new Date().toISOString()}] [run] ${err?.stack || err?.message || err}`);
+    } catch (err: unknown) {
+      logError("agent.run", err, { conversationId: convId });
       try {
         if (session.abort.signal.aborted) {
           emit({ type: "run-status", status: "cancelled" });
         } else {
-          vscode.window.showErrorMessage(`OpenCursor: Connection failed: ${err.message}`);
-          emit({ type: "error", message: err.message } as AgentEvent);
+          const message = err instanceof Error ? err.message : String(err);
+          vscode.window.showErrorMessage(`OpenCursor: Agent failed: ${message}`);
+          emit({ type: "error", message } as AgentEvent);
           emit({ type: "run-status", status: "error" });
         }
       } catch { /* emit must never throw out of run */ }
@@ -1587,8 +1589,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         session.turns = forceSettleOpenWork(closeTrailingThinking(session.turns), "cancelled");
         if (session.persistTimer) { clearTimeout(session.persistTimer); session.persistTimer = undefined; }
         await this._store.update(convId, { turns: session.turns, steps: history });
-      } catch (e: any) {
-        SidebarProvider.log.appendLine(`[run] finally: ${e?.message || e}`);
+      } catch (e: unknown) {
+        logError("agent.cleanup", e, { conversationId: convId });
       } finally {
         this._sessions.delete(convId);
         this._sendConversations();

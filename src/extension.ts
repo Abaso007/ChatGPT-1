@@ -23,9 +23,11 @@ import { initOAuth } from './agent/oauth';
 import { initUsage } from './stores/usageStore';
 import { initModelRegistry, applyEmbedModel } from './stores/modelRegistry';
 import { initRuntimeDeps } from './runtimeDeps';
+import { initLog, logError } from './logging';
 
 export function activate(context: vscode.ExtensionContext) {
-  console.log('OpenCursor is now active!');
+  const log = initLog(context);
+  log.appendLine(`[${new Date().toISOString()}] OpenCursor activated`);
 
   // Heavy native deps (onnxruntime, sharp, transformers) are not shipped in the
   // VSIX; they are downloaded to globalStorage on first use.
@@ -47,24 +49,20 @@ export function activate(context: vscode.ExtensionContext) {
   setDocsStorageDir(context.globalStorageUri.fsPath);
   setDocSourcesProvider(() => featureStore.get().docSources ?? []);
   applyEmbedModel(featureStore.get().embedModel || "minilm")
-    .then(() => initIndexWatch(context, featureStore))
-    .catch(() => initIndexWatch(context, featureStore));
+    .catch((error) => logError("startup.embed-model", error))
+    .finally(() => initIndexWatch(context, featureStore));
 
   // Connect any enabled MCP servers in the background.
-  mcpManager.sync(featureStore.get().mcpServers).catch(() => {});
+  void mcpManager.sync(featureStore.get().mcpServers).catch((error) => logError("startup.mcp", error));
 
   // llama.cpp local models: detect install, then auto-load flagged models.
   initLlamacpp(context);
-  checkInstalled().then(() => {
+  void checkInstalled().then(() => {
     const f = featureStore.get();
     for (const m of f.llamacppModels) {
-      if (m.autoLoad) loadModel(m, f.llamacppConfig).catch(() => {});
+      if (m.autoLoad) void loadModel(m, f.llamacppConfig).catch((error) => logError("startup.llamacpp-load", error, { model: m.id }));
     }
-  });
-
-  // Create the shared output channel while the extension host is alive and
-  // dispose it with the extension (avoids "DisposableStore already disposed" leaks).
-  context.subscriptions.push(SidebarProvider.log);
+  }).catch((error) => logError("startup.llamacpp-check", error));
 
   const sidebarProvider = new SidebarProvider(context, settingsManager, featureStore);
   context.subscriptions.push(

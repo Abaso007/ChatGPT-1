@@ -27,6 +27,7 @@ import {
 	THINKING_INTERVAL_MS,
 	SUBAGENT_INTERVAL_MS,
 } from "../shared/streamPolicy";
+import { logError } from "../logging";
 
 // Appended after every live user query in multitask mode so the model never
 // forgets it is a COORDINATOR: edit tools are disabled and all work must be
@@ -283,10 +284,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						title,
 						text: finalText || "(subagent finished with no summary)",
 					}))
-					.catch((e) => ({
-						title,
-						text: `(subagent failed: ${e instanceof Error ? e.message : String(e)})`,
-					}))
+					.catch((e) => {
+						logError("task.background", e, { title, callId });
+						return {
+							title,
+							text: `(subagent failed: ${e instanceof Error ? e.message : String(e)})`,
+						};
+					})
 					.finally(() => {
 						parentSig.removeEventListener("abort", onParentAbort);
 						onHook?.("subagentStop", { subagent: title });
@@ -302,6 +306,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				if (childAC.signal.aborted || parentSig.aborted) {
 					return "(subagent cancelled)";
 				}
+				logError("task.foreground", e, { subagent: subagentName, callId });
 				return `(subagent failed: ${e instanceof Error ? e.message : String(e)})`;
 			} finally {
 				parentSig.removeEventListener("abort", onParentAbort);
@@ -832,6 +837,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						finishUi(i);
 					} catch (e) {
 						const msg = e instanceof Error ? e.message : String(e);
+						logError("tool.mcp", e, { tool: call.name, callId: call.id });
 						if (completedUi.has(i)) return;
 						results[i] = {
 							status: "error",
@@ -938,6 +944,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						);
 					} catch (e) {
 						const msg = e instanceof Error ? e.message : String(e);
+						logError("tool.execute", e, { tool: call.name, callId: call.id });
 						try { toolAc.abort(); } catch { /* ignore */ }
 						const isTo = timedOut || msg.startsWith("timeout:") || msg.startsWith("aborted:");
 						r = {
@@ -968,6 +975,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					// Immediate UI settle (especially on timeout) — do not wait for siblings.
 					finishUi(i);
 				} catch (e) {
+					logError("tool.lifecycle", e, { tool: call.name, callId: call.id });
 					results[i] = { status: "error", output: `error: ${e instanceof Error ? e.message : String(e)}` };
 					finishUi(i);
 				}
@@ -1077,6 +1085,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			emitSettled("cancelled");
 			return;
 		}
+		logError("agent.loop", e, { model, mode, isSubagent: Boolean(isSubagent) });
 		try { emit({ type: "error", message: e instanceof Error ? e.message : String(e) }); } catch { /* ignore */ }
 		emitSettled("error");
 	} finally {
