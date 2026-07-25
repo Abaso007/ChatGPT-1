@@ -8,6 +8,7 @@
  */
 
 import { Step, WireContentPart, WireMessage, CacheControl } from "./types";
+import { economizeHistoryHard } from "./contextEconomy";
 
 const EPHEMERAL: CacheControl = { type: "ephemeral" };
 
@@ -30,33 +31,34 @@ export function stepTokens(s: Step): number {
 
 /**
  * Trim oldest history so the built request fits `budgetTokens`. Always keeps the
- * system prompt and the final user turn (plus everything after it). Drops whole
- * leading steps from the oldest end; never leaves a kept window starting on a
- * tool-result (which would orphan it from its tool_call).
+ * system prompt and the final user turn (plus everything after it).
+ * Hard-slims dump bodies / edit payloads first so todos, assistant text, and
+ * edit receipts survive longer before whole steps are dropped.
  */
 export function fitStepsToBudget(steps: Step[], system: string, budgetTokens: number): Step[] {
   const sysTokens = Math.ceil(system.length / 4);
   let budget = budgetTokens - sysTokens;
   if (budget <= 0) return steps;
 
-  // The last user turn onward is non-negotiable (the current request + its tools).
+  // Clone + hard-slim dumps so we do not mutate the live history further, and
+  // so bulk file bodies no longer force dropping of durable task state.
+  const work = steps.map((s) => structuredClone(s));
+  economizeHistoryHard(work);
+
   let lastUserIdx = 0;
-  for (let i = steps.length - 1; i >= 0; i--) {
-    if (steps[i].kind === "user") { lastUserIdx = i; break; }
+  for (let i = work.length - 1; i >= 0; i--) {
+    if (work[i].kind === "user") { lastUserIdx = i; break; }
   }
 
-  const tail = steps.slice(lastUserIdx);
+  const tail = work.slice(lastUserIdx);
   let used = tail.reduce((n, s) => n + stepTokens(s), 0);
-
-  // Walk backwards through the prefix, keeping recent steps while they fit.
   const kept: Step[] = [];
   for (let i = lastUserIdx - 1; i >= 0; i--) {
-    const t = stepTokens(steps[i]);
+    const t = stepTokens(work[i]);
     if (used + t > budget) break;
     used += t;
-    kept.unshift(steps[i]);
+    kept.unshift(work[i]);
   }
-  // Don't start the kept prefix on a tool-result (orphaned from its tool_call).
   while (kept.length && kept[0].kind === "tool-result") {
     used -= stepTokens(kept[0]);
     kept.shift();
@@ -91,17 +93,27 @@ export function splitForCompaction(steps: Step[], keepTokens: number): { prefix:
   return { prefix: steps.slice(0, cut), tail: steps.slice(cut) };
 }
 
-/** Serialize steps to plain text for the summarizer (tool outputs truncated). */
+/** Serialize steps to plain text for the summarizer (dump bodies truncated; todos/edits kept). */
 export function stepsToTranscript(steps: Step[]): string {
   const out: string[] = [];
+  const keepFull = new Set([
+    "TodoWrite", "TodoRead", "Task", "AskQuestion", "SwitchMode", "WritePlan",
+    "StrReplace", "Write", "Delete", "EditNotebook",
+  ]);
   for (const s of steps) {
     if (s.kind === "user") {
       out.push(`## User\n${s.text}`);
     } else if (s.kind === "assistant") {
+      // Prefer generated output text over thinking (thinking is UI-only anyway).
       if (s.text) out.push(`## Assistant\n${s.text}`);
-      for (const c of s.calls || []) out.push(`## Assistant tool call: ${c.name}\n${(c.arguments || "").slice(0, 400)}`);
+      for (const c of s.calls || []) {
+        const args = c.arguments || "";
+        const cap = keepFull.has(c.name) ? 800 : 200;
+        out.push(`## Assistant tool call: ${c.name}\n${args.slice(0, cap)}`);
+      }
     } else {
-      out.push(`## Tool result (${s.name})\n${(s.output || "").slice(0, 600)}`);
+      const cap = keepFull.has(s.name) ? 2000 : 300;
+      out.push(`## Tool result (${s.name})\n${(s.output || "").slice(0, cap)}`);
     }
   }
   return out.join("\n\n");

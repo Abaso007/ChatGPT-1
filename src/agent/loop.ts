@@ -462,9 +462,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		const summarizeSteps = async (steps: Step[]): Promise<string> => {
 			const sys =
 				"You compress an agent coding session transcript. Write a dense summary that preserves: " +
-				"1) the user's original request(s) and intent, 2) what was done (files created/edited/deleted with paths), " +
-				"3) key decisions and why, 4) errors hit and fixes, 5) unfinished work / next steps. " +
-				"Use short markdown sections. Do not invent details.";
+				"1) the user's original request(s) and intent, " +
+				"2) files created/edited/deleted with paths and short change notes (e.g. +12 -5), not full code, " +
+				"3) the latest todo list / task status if present, " +
+				"4) key assistant conclusions and decisions (not chain-of-thought), " +
+				"5) subagent/task outcomes, 6) errors hit and fixes, 7) unfinished work / next steps. " +
+				"Use short markdown sections. Do not invent details. Do not paste large file bodies.";
 			let text = "";
 			for await (const ev of streamChat({
 				apiBaseUrl,
@@ -1020,8 +1023,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				if (call.name === "WritePlan" && r.status === "completed") {
 					planWritten = true;
 				}
-				// Keep newest evidence intact. economizeHistory prunes it only after
-				// four newer results exist, preserving active reasoning quality.
+				// Live-turn results stay full; economizeHistory stubs older dumps only.
 				pushHistory({ kind: "tool-result", callId: call.id, name: call.name, output: r.output, status: r.status, image: r.image });
 			}
 			// After launching background Task(s), wait for that wave before calling the

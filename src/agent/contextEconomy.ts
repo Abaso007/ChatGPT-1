@@ -12,15 +12,15 @@ import type { Step, ToolCall } from "./types";
 /**
  * Token economy for long agent traces.
  *
- * Critical invariant: never prune or slim anything in the LIVE turn (the last
- * user message and everything after it). Mid-task pruning caused infinite loops
- * because the model forgot what it just read/edited and re-did the same work.
+ * Keep durable task state: user messages, assistant text (not thinking),
+ * todos, task/subagent results, edit receipts, Q&A, mode/plan changes.
  *
- * Older turns may be pruned aggressively; the live turn stays verbatim until
- * the next user message or an LLM compaction at a safe boundary.
+ * Drop bulk file bodies: Read/Grep/search dumps and full edit payloads become
+ * short path + size / +N -M stubs. Live turn (last user message onward) stays
+ * verbatim so mid-task work is not forgotten.
  */
 
-/** Exploration / dump tools — full body rarely needed after the next few turns. */
+/** Exploration / dump tools — full body rarely needed after the live turn. */
 const STALEABLE = new Set([
   "Read",
   "Grep",
@@ -36,8 +36,21 @@ const STALEABLE = new Set([
   "ReadLints",
   "ListMcpResources",
   "FetchMcpResource",
-  "TodoRead",
   "CallMcpTool",
+]);
+
+/** Durable task state — never stub results (already short or must stay visible). */
+const PROTECTED_RESULTS = new Set([
+  "TodoWrite",
+  "TodoRead",
+  "Task",
+  "AskQuestion",
+  "SwitchMode",
+  "WritePlan",
+  "StrReplace",
+  "Write",
+  "Delete",
+  "EditNotebook",
 ]);
 
 /** Edit payloads: once applied in an OLDER turn, re-sending full strings is waste. */
@@ -45,83 +58,146 @@ const SLIM_ARGS = new Set(["StrReplace", "Write", "EditNotebook", "Delete"]);
 
 const PRUNE_MARK = "[context pruned]";
 
-/**
- * Keep this many most-recent tool results verbatim from *before* the live turn.
- * Live-turn results are never pruned (see economizeHistory).
- */
-const KEEP_RECENT_RESULTS = 12;
+/** Keep this many most-recent dump results verbatim from *before* the live turn. */
+const KEEP_RECENT_DUMPS = 4;
 
-/** Keep this many most-recent assistant tool-call batches (pre-live-turn) with full args. */
-const KEEP_RECENT_CALL_BATCHES = 6;
+/** Keep this many most-recent assistant tool-call batches (pre-live) with full args. */
+const KEEP_RECENT_CALL_BATCHES = 4;
 
-/** Only prune results larger than this (chars). */
-const MIN_PRUNE_CHARS = 800;
-
-/** Cap for slimmed string fields inside tool args. */
-const SLIM_FIELD = 240;
+/** Only prune dump results larger than this (chars). */
+const MIN_PRUNE_CHARS = 400;
 
 function isPruned(s: string): boolean {
   return s.startsWith(PRUNE_MARK);
 }
 
-function stubResult(name: string, output: string, status: string): string {
-  const n = output.length;
-  const lines = output.split(/\r?\n/);
-  const signal = lines.filter((line) =>
-    /error|fail|exception|warning|warn|fatal|denied|timeout|not found|cannot|invalid|exit [1-9]|^\s*[-+]{3}|^\s*@@|^\s*\d+[|:]/i.test(line),
-  );
-  const evidence = (signal.length ? signal.slice(0, 10) : [...lines.slice(0, 4), ...lines.slice(-4)])
-    .join("\n")
-    .slice(0, 1200)
-    .trim();
-  const pathHint =
-    /(?:^|\n)(?:\d+\|)?([^\n]{0,80})/.exec(output)?.[1]?.trim() ||
-    /(?:path|file)["']?\s*[:=]\s*["']?([^\s"']+)/i.exec(output)?.[1] ||
-    "";
-  const where = pathHint && pathHint.length < 80 ? ` · ${pathHint}` : "";
-  return `${PRUNE_MARK} ${name}${where} · ${n} chars · ${status}. Re-call tool if needed.${evidence ? `\n${evidence}` : ""}`;
+function lineCount(s: string): number {
+  if (!s) return 0;
+  return s.split(/\r?\n/).length;
 }
 
-function slimValue(v: unknown, depth = 0): unknown {
+/** +added -removed line estimate from before/after snippets. */
+function lineDelta(before: string, after: string): string {
+  const b = lineCount(before);
+  const a = lineCount(after);
+  const plus = Math.max(0, a - b);
+  const minus = Math.max(0, b - a);
+  // When lengths match, still note a same-size replace.
+  if (plus === 0 && minus === 0) {
+    return b <= 1 ? `~${before.length}→${after.length}ch` : `~${b} lines rewritten`;
+  }
+  return `+${plus} -${minus}`;
+}
+
+function argPath(a: Record<string, unknown>): string {
+  for (const k of ["path", "target_notebook", "target_directory", "url", "file"]) {
+    const v = a[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
+}
+
+/** One-line stub for dump tool results — path + size, no file body. */
+function stubDumpResult(name: string, output: string, status: string, argsHint?: string): string {
+  const n = output.length;
+  const lines = output.split(/\r?\n/).length;
+  const pathFromOut =
+    /(?:^|\n)(?:file|path)["']?\s*[:=]\s*["']?([^\s"']+)/i.exec(output)?.[1] ||
+    /(?:^|\n)([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,12})(?:\n|:|\s\|)/.exec(output)?.[1] ||
+    "";
+  const where = (argsHint || pathFromOut || "").slice(0, 120);
+  const err =
+    status === "error" || /^error:/i.test(output)
+      ? ` · ${(output.split(/\r?\n/)[0] || "").slice(0, 160)}`
+      : "";
+  return `${PRUNE_MARK} ${name}${where ? ` · ${where}` : ""} · ${lines} lines · ${n} chars · ${status}.${err} Re-call if needed.`;
+}
+
+/** Compact edit tool args: path + line stats, no code bodies. */
+function slimEditArgs(name: string, args: string): string {
+  try {
+    const a = JSON.parse(args || "{}") as Record<string, unknown>;
+    const path = argPath(a);
+    if (name === "Delete") {
+      return JSON.stringify({ path: path || a.path, _pruned: "deleted" });
+    }
+    if (name === "Write") {
+      const contents = typeof a.contents === "string" ? a.contents : "";
+      return JSON.stringify({
+        path,
+        _pruned: `wrote ${lineCount(contents)} lines (${contents.length} chars)`,
+      });
+    }
+    if (name === "StrReplace") {
+      const oldS = typeof a.old_string === "string" ? a.old_string : "";
+      const newS = typeof a.new_string === "string" ? a.new_string : "";
+      const out: Record<string, unknown> = {
+        path,
+        _pruned: `edit ${lineDelta(oldS, newS)}`,
+      };
+      if (a.replace_all || a.allow_multiple_matches) out.replace_all = true;
+      return JSON.stringify(out);
+    }
+    if (name === "EditNotebook") {
+      const oldS = typeof a.old_string === "string" ? a.old_string : "";
+      const newS = typeof a.new_string === "string" ? a.new_string : "";
+      return JSON.stringify({
+        target_notebook: a.target_notebook,
+        cell_idx: a.cell_idx,
+        is_new_cell: a.is_new_cell,
+        cell_language: a.cell_language,
+        _pruned: a.is_new_cell ? `new cell (${lineCount(newS)} lines)` : `edit ${lineDelta(oldS, newS)}`,
+      });
+    }
+  } catch {
+    /* fall through */
+  }
+  return args.slice(0, 200) + `…[+${Math.max(0, args.length - 200)} chars pruned]`;
+}
+
+function slimCallArgs(name: string, args: string): string {
+  if (!args) return args;
+  if (SLIM_ARGS.has(name)) {
+    // Always collapse edit bodies once outside the recent window — even small ones.
+    if (args.length < 80 && name === "Delete") return args;
+    return slimEditArgs(name, args);
+  }
+  if (name.startsWith("mcp__") && args.length >= MIN_PRUNE_CHARS) {
+    try {
+      const parsed = JSON.parse(args);
+      return JSON.stringify(slimGeneric(parsed));
+    } catch {
+      return args.slice(0, 300) + `…[+${args.length - 300} chars pruned]`;
+    }
+  }
+  // Non-edit tools: hard cap only if enormous.
+  if (args.length < 2000) return args;
+  return args.slice(0, 400) + `…[+${args.length - 400} chars pruned]`;
+}
+
+function slimGeneric(v: unknown, depth = 0): unknown {
   if (depth > 4) return "…";
   if (typeof v === "string") {
-    if (v.length <= SLIM_FIELD) return v;
-    return `${v.slice(0, SLIM_FIELD)}…[+${v.length - SLIM_FIELD} chars]`;
+    if (v.length <= 200) return v;
+    return `${v.slice(0, 200)}…[+${v.length - 200} chars]`;
   }
   if (Array.isArray(v)) {
-    if (v.length > 8) return [...v.slice(0, 6).map((x) => slimValue(x, depth + 1)), `…(+${v.length - 6})`];
-    return v.map((x) => slimValue(x, depth + 1));
+    if (v.length > 8) return [...v.slice(0, 6).map((x) => slimGeneric(x, depth + 1)), `…(+${v.length - 6})`];
+    return v.map((x) => slimGeneric(x, depth + 1));
   }
   if (v && typeof v === "object") {
     const o = v as Record<string, unknown>;
     const out: Record<string, unknown> = {};
     for (const [k, val] of Object.entries(o)) {
-      // Keep paths/ids intact for orientation.
-      if (/^(path|id|callId|name|command|pattern|query)$/i.test(k) && typeof val === "string" && val.length < 500) {
+      if (/^(path|id|callId|name|command|pattern|query|url)$/i.test(k) && typeof val === "string" && val.length < 500) {
         out[k] = val;
       } else {
-        out[k] = slimValue(val, depth + 1);
+        out[k] = slimGeneric(val, depth + 1);
       }
     }
     return out;
   }
   return v;
-}
-
-function slimCallArgs(name: string, args: string): string {
-  if (!args || args.length < MIN_PRUNE_CHARS) return args;
-  if (!SLIM_ARGS.has(name) && !name.startsWith("mcp__")) {
-    // Non-edit tools: hard cap only if enormous.
-    if (args.length < 2000) return args;
-    return args.slice(0, 400) + `…[+${args.length - 400} chars pruned]`;
-  }
-  try {
-    const parsed = JSON.parse(args);
-    const slimmed = slimValue(parsed);
-    return JSON.stringify(slimmed);
-  } catch {
-    return args.slice(0, 300) + `…[+${args.length - 300} chars pruned]`;
-  }
 }
 
 /** Tools whose repeat calls on the same target supersede older results (latest wins). */
@@ -134,7 +210,6 @@ function dedupKey(name: string, args: string): string | undefined {
     const a = JSON.parse(args || "{}") as Record<string, unknown>;
     const target = a.path ?? a.target_directory ?? a.url ?? a.glob_pattern ?? a.pattern ?? a.query;
     if (typeof target !== "string" || !target) return name === "TodoRead" ? name : undefined;
-    // Read with explicit ranges targets different slices — keep them distinct.
     const range = a.offset != null || a.limit != null ? `#${a.offset ?? ""}:${a.limit ?? ""}` : "";
     return `${name}:${target}${range}`;
   } catch {
@@ -142,14 +217,20 @@ function dedupKey(name: string, args: string): string | undefined {
   }
 }
 
+function callArgsById(steps: Step[]): Map<string, string> {
+  const m = new Map<string, string>();
+  for (const s of steps) {
+    if (s.kind !== "assistant") continue;
+    for (const c of s.calls || []) m.set(c.id, c.arguments || "");
+  }
+  return m;
+}
+
 /**
- * Latest-wins dedup (GitAuto/Cline-style): when the same file/dir/url was read
- * multiple times in OLDER turns, older copies become one-line supersede stubs.
- * Never touches the live turn — mid-task re-reads must stay visible so the
- * agent can see progress and avoid loops.
+ * Latest-wins dedup: older duplicate Reads/etc become one-line supersede stubs.
+ * Never touches the live turn.
  */
 function dedupeRepeatedResults(steps: Step[], liveFrom: number): number {
-  // Map callId -> dedup key from the assistant call that issued it.
   const keyByCallId = new Map<string, string>();
   for (const s of steps) {
     if (s.kind !== "assistant") continue;
@@ -158,8 +239,6 @@ function dedupeRepeatedResults(steps: Step[], liveFrom: number): number {
       if (k) keyByCallId.set(c.id, k);
     }
   }
-  // Last occurrence per key wins (may be inside the live turn — that's fine;
-  // we only stub older copies that sit before liveFrom).
   const lastIdxByKey = new Map<string, number>();
   for (let i = 0; i < steps.length; i++) {
     const s = steps[i];
@@ -171,9 +250,10 @@ function dedupeRepeatedResults(steps: Step[], liveFrom: number): number {
   for (let i = 0; i < liveFrom; i++) {
     const s = steps[i];
     if (s.kind !== "tool-result" || s.image) continue;
+    if (PROTECTED_RESULTS.has(s.name) && s.name !== "TodoRead") continue;
     const k = keyByCallId.get(s.callId);
     if (!k || lastIdxByKey.get(k) === i) continue;
-    if (isPruned(s.output) || s.output.length < 200) continue;
+    if (isPruned(s.output) || s.output.length < 120) continue;
     steps[i] = { ...s, output: `${PRUNE_MARK} superseded by a newer ${s.name} of the same target — use the latest result.` };
     deduped++;
   }
@@ -187,46 +267,64 @@ function lastUserIndex(steps: Step[]): number {
   return 0;
 }
 
+function isStaleableResult(name: string): boolean {
+  if (PROTECTED_RESULTS.has(name)) return false;
+  return STALEABLE.has(name) || name.startsWith("mcp__");
+}
+
 /**
  * In-place history shrink for the model wire.
- * Never mutates the live turn (last user message onward) — that is what stops
- * mid-task amnesia / infinite tool loops.
+ * Never mutates the live turn (last user message onward).
+ * Never drops assistant text, todos, edits, or task results — only dump bodies.
  */
 export function economizeHistory(steps: Step[]): { prunedResults: number; slimmedCalls: number } {
   let prunedResults = 0;
   let slimmedCalls = 0;
-  if (steps.length < 4) return { prunedResults, slimmedCalls };
+  if (steps.length < 4) {
+    // Still strip thinking (UI-only) everywhere.
+    for (let i = 0; i < steps.length; i++) {
+      const s = steps[i];
+      if (s.kind === "assistant" && s.thinking) steps[i] = { ...s, thinking: undefined };
+    }
+    return { prunedResults, slimmedCalls };
+  }
 
   const liveFrom = lastUserIndex(steps);
+  const argsByCall = callArgsById(steps);
 
   // 0) Latest-wins dedup only on pre-live history.
   prunedResults += dedupeRepeatedResults(steps, liveFrom);
 
-  // 1) Stub stale tool dumps from older turns, keeping a generous recent window.
-  const resultIdxs: number[] = [];
+  // 1) Stub dump tool bodies from older turns. Keep a small recent dump window.
+  const dumpIdxs: number[] = [];
   for (let i = 0; i < liveFrom; i++) {
-    if (steps[i].kind === "tool-result") resultIdxs.push(i);
+    const s = steps[i];
+    if (s.kind === "tool-result" && isStaleableResult(s.name)) dumpIdxs.push(i);
   }
-  const keepFrom =
-    resultIdxs.length <= KEEP_RECENT_RESULTS
-      ? 0
-      : resultIdxs[resultIdxs.length - KEEP_RECENT_RESULTS];
+  const keepDumpsFrom =
+    dumpIdxs.length <= KEEP_RECENT_DUMPS ? 0 : dumpIdxs[dumpIdxs.length - KEEP_RECENT_DUMPS];
 
   for (let i = 0; i < liveFrom; i++) {
     const s = steps[i];
     if (s.kind !== "tool-result") continue;
-    if (i >= keepFrom) continue;
-    if (!STALEABLE.has(s.name) && !s.name.startsWith("mcp__")) continue;
+    if (!isStaleableResult(s.name)) continue;
+    if (i >= keepDumpsFrom) continue;
     if (isPruned(s.output) || s.output.length < MIN_PRUNE_CHARS) continue;
     if (s.image) continue;
+    let pathHint = "";
+    try {
+      pathHint = argPath(JSON.parse(argsByCall.get(s.callId) || "{}") as Record<string, unknown>);
+    } catch {
+      /* ignore */
+    }
     steps[i] = {
       ...s,
-      output: stubResult(s.name, s.output, s.status),
+      output: stubDumpResult(s.name, s.output, s.status, pathHint),
     };
     prunedResults++;
   }
 
-  // 2) Slim old edit-arg payloads from older turns only.
+  // 2) Slim old edit-arg payloads from older turns only (path + +/- stats).
   const callBatchIdxs: number[] = [];
   for (let i = 0; i < liveFrom; i++) {
     const s = steps[i];
@@ -251,6 +349,7 @@ export function economizeHistory(steps: Step[]): { prunedResults: number; slimme
       }
       return c;
     });
+    // Keep assistant text; drop thinking (UI-only).
     if (changed) {
       steps[i] = { ...s, calls: next, thinking: undefined };
     } else if (s.thinking) {
@@ -267,6 +366,51 @@ export function economizeHistory(steps: Step[]): { prunedResults: number; slimme
   }
 
   return { prunedResults, slimmedCalls };
+}
+
+/**
+ * Extra pass when still over budget: stub ALL pre-live dump results (no recent
+ * window), then slim ALL pre-live edit args. Does not drop steps or assistant text.
+ */
+export function economizeHistoryHard(steps: Step[]): void {
+  const liveFrom = lastUserIndex(steps);
+  const argsByCall = callArgsById(steps);
+  for (let i = 0; i < liveFrom; i++) {
+    const s = steps[i];
+    if (s.kind === "tool-result" && isStaleableResult(s.name) && !s.image && !isPruned(s.output) && s.output.length >= 80) {
+      let pathHint = "";
+      try {
+        pathHint = argPath(JSON.parse(argsByCall.get(s.callId) || "{}") as Record<string, unknown>);
+      } catch {
+        /* ignore */
+      }
+      steps[i] = { ...s, output: stubDumpResult(s.name, s.output, s.status, pathHint) };
+    }
+    if (s.kind === "assistant" && s.calls?.length) {
+      let changed = false;
+      const next = s.calls.map((c) => {
+        if (!SLIM_ARGS.has(c.name) && !c.name.startsWith("mcp__")) return c;
+        const slim = slimCallArgs(c.name, c.arguments || "");
+        if (slim !== c.arguments) {
+          changed = true;
+          return { ...c, arguments: slim };
+        }
+        return c;
+      });
+      if (changed || s.thinking) steps[i] = { ...s, calls: next, thinking: undefined };
+    }
+  }
+}
+
+/** True if a step is durable task state that budget-trim must prefer to keep. */
+export function isProtectedStep(s: Step): boolean {
+  if (s.kind === "user") return true;
+  if (s.kind === "assistant") {
+    // Assistant text or non-dump tool calls (todos/edits/tasks) are durable.
+    if ((s.text || "").trim()) return true;
+    return (s.calls || []).some((c) => PROTECTED_RESULTS.has(c.name) || SLIM_ARGS.has(c.name));
+  }
+  return PROTECTED_RESULTS.has(s.name);
 }
 
 /** Hard safety trigger. Normal compaction waits for a semantic boundary. */
