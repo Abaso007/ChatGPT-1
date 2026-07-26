@@ -59,7 +59,7 @@ const ANTHROPIC = {
     "claude-opus-4-7",
     "claude-sonnet-4-6",
     "claude-opus-4-5",
-    "claude-haiku-4-5",
+    "claude-haiku-4-5"
   ],
 } as const;
 
@@ -95,10 +95,10 @@ const ANTIGRAVITY = {
   loadCodeAssistUrl: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
   onboardUserUrl: "https://cloudcode-pa.googleapis.com/v1internal:onboardUser",
   quotaUrl: "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
-  apiBase: "https://daily-cloudcode-pa.googleapis.com",
-  userAgent: "antigravity/1.107.0",
+  apiBase: "https://cloudcode-pa.googleapis.com",
+  userAgent: "antigravity/ide/2.1.1 darwin/arm64",
   apiClient: "google-cloud-sdk vscode_cloudshelleditor/0.1",
-  models: ["gemini-3-flash-agent", "gemini-3.5-flash-low", "gemini-pro-agent", "gemini-3.1-pro-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium", "gemini-3-flash"],
+  models: ["gemini-3-flash-agent", "gemini-3.5-flash-low", "gemini-3.5-flash-extra-low", "gemini-pro-agent", "gemini-3.1-pro-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium", "gemini-3-flash"],
 } as const;
 
 export const OAUTH_LABEL: Record<OAuthKind, string> = { "claude-code": "Claude Code", codex: "OpenAI Codex", antigravity: "Google Antigravity" };
@@ -460,14 +460,17 @@ async function exchangeCodex(code: string, verifier: string): Promise<OAuthAccou
   };
 }
 
-const AG_METADATA = { ideType: 9, platform: 1, pluginType: 2 };
+const AG_PLATFORM = process.platform === "win32" ? 5 : process.platform === "linux" ? 3 : process.arch === "arm64" ? 2 : 1;
+const AG_METADATA = { ideType: 9, platform: AG_PLATFORM, pluginType: 2 };
 
 function agHeaders(token: string) {
   return {
     authorization: `Bearer ${token}`,
     "content-type": "application/json",
-    "user-agent": ANTIGRAVITY.userAgent,
+    "user-agent": "google-api-nodejs-client/9.15.1",
     "x-goog-api-client": ANTIGRAVITY.apiClient,
+    "client-metadata": JSON.stringify(AG_METADATA),
+    "x-request-source": "local",
   };
 }
 
@@ -703,7 +706,6 @@ async function getAntigravityLimits(acc: OAuthAccount): Promise<OAuthLimit[]> {
   const out: OAuthLimit[] = [];
   for (const [key, info] of Object.entries<any>(d.models ?? {})) {
     if (!info?.quotaInfo || info.isInternal) continue;
-    if (!(ANTIGRAVITY.models as readonly string[]).includes(key)) continue;
     const remaining = Number(info.quotaInfo.remainingFraction ?? 0);
     out.push({ label: info.displayName || key, remaining: Math.max(0, Math.min(100, Math.round(remaining * 100))), limit: 100, resetsAt: parseResetMs(info.quotaInfo.resetTime) });
   }
@@ -839,19 +841,22 @@ async function* streamClaudeCode(id: string, opts: {
     body.tools = opts.tools.map((t) => ({ name: t.function.name, description: t.function.description, input_schema: t.function.parameters }));
   }
 
-  const betas = ["oauth-2025-04-20", ...reasoningBetas];
+  const betas = new Set(["claude-code-20250219", "oauth-2025-04-20", "interleaved-thinking-2025-05-14", ...reasoningBetas]);
   // 1M is the default on Opus 5 / Fable 5 / Sonnet 5 / 4.6+ — beta only for older models.
   if (opts.modelParams?.maxContext === "1m" && needsContext1mBeta(opts.model)) {
-    betas.push("context-1m-2025-08-07");
+    betas.add("context-1m-2025-08-07");
   }
   const r = await fetch("https://api.anthropic.com/v1/messages?beta=true", {
     method: "POST",
     headers: {
       authorization: `Bearer ${acc.accessToken}`,
       "anthropic-version": "2023-06-01",
-      "anthropic-beta": betas.join(","),
+      "anthropic-beta": [...betas].join(","),
       "anthropic-dangerous-direct-browser-access": "true",
       "content-type": "application/json",
+      accept: "text/event-stream",
+      "user-agent": "claude-cli/2.1.92 (external, sdk-cli)",
+      "x-app": "cli",
     },
     body: JSON.stringify(body),
     signal: opts.signal,
@@ -885,6 +890,8 @@ async function* streamCodex(id: string, opts: {
     body.tools = opts.tools.map((t) => ({ type: "function", name: t.function.name, description: t.function.description, parameters: t.function.parameters }));
   }
 
+  const sessionId = crypto.randomUUID();
+  body.prompt_cache_key = sessionId;
   const r = await fetch(CODEX.responsesUrl, {
     method: "POST",
     headers: {
@@ -892,8 +899,8 @@ async function* streamCodex(id: string, opts: {
       "content-type": "application/json",
       accept: "text/event-stream",
       originator: CODEX.originator,
-      version: CODEX.cliVersion,
       "user-agent": `codex_cli_rs/${CODEX.cliVersion}`,
+      session_id: sessionId,
       ...(acc.accountId ? { "ChatGPT-Account-ID": acc.accountId } : {}),
     },
     body: JSON.stringify(body),
@@ -1111,6 +1118,7 @@ const ANTIGRAVITY_THOUGHT_SIGNATURE =
 function toGemini(messages: WireMessage[]): { system?: { parts: GeminiPart[] }; contents: { role: "user" | "model"; parts: GeminiPart[] }[] } {
   const sys: GeminiPart[] = [];
   const contents: { role: "user" | "model"; parts: GeminiPart[] }[] = [];
+  const toolNames = new Map<string, string>();
   const pushUserPart = (p: GeminiPart) => {
     const last = contents[contents.length - 1];
     if (last && last.role === "user") last.parts.push(p);
@@ -1135,6 +1143,7 @@ function toGemini(messages: WireMessage[]): { system?: { parts: GeminiPart[] }; 
       for (const tc of m.tool_calls ?? []) {
         let args: any = {};
         try { args = JSON.parse(tc.function.arguments || "{}"); } catch { /* keep {} */ }
+        toolNames.set(tc.id, tc.function.name);
         // Gemini 3+ requires a thoughtSignature on every function call in history.
         parts.push({ thoughtSignature: ANTIGRAVITY_THOUGHT_SIGNATURE, functionCall: { name: tc.function.name, args } });
       }
@@ -1143,7 +1152,7 @@ function toGemini(messages: WireMessage[]): { system?: { parts: GeminiPart[] }; 
       const out = typeof m.content === "string" ? m.content : m.content.filter((p) => p.type === "text").map((p: any) => p.text).join("\n");
       let response: any;
       try { response = JSON.parse(out); } catch { response = { result: out }; }
-      pushUserPart({ functionResponse: { name: m.tool_call_id, response } });
+      pushUserPart({ functionResponse: { name: toolNames.get(m.tool_call_id) ?? m.tool_call_id, response } });
     }
   }
   return { system: sys.length ? { parts: sys } : undefined, contents };
@@ -1159,7 +1168,7 @@ async function* streamAntigravity(id: string, opts: {
 }): AsyncGenerator<ProviderEvent> {
   const acc = await validAccount(id);
   const { system, contents } = toGemini(opts.messages);
-  const maxTokens = Math.min(opts.maxTokens && opts.maxTokens > 0 ? opts.maxTokens : 8192, 16384);
+  const maxTokens = Math.min(opts.maxTokens && opts.maxTokens > 0 ? opts.maxTokens : 8192, 64000);
 
   const request: Record<string, unknown> = {
     contents,
@@ -1180,7 +1189,7 @@ async function* streamAntigravity(id: string, opts: {
     model: opts.model,
     userAgent: "antigravity",
     requestType: "agent",
-    requestId: `agent-${crypto.randomUUID()}`,
+    requestId: `agent/${crypto.randomUUID()}/${Date.now()}/${crypto.randomUUID()}/0`,
     request,
   };
 

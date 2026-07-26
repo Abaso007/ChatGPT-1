@@ -689,7 +689,7 @@ body {
 .subagent-card-subtitle { padding: var(--sp-2) 0 0 28px; font-size: 11px; font-weight: 400; color: var(--fg-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .subagent-card:hover { border-color: var(--line); border-left-color: var(--purple); background: var(--purple-weak); transform: translateX(1px); }
 .subagent-card.needs-approval { border-left-color: var(--warn); }
-.subagent-approvals { display: flex; flex-direction: column; gap: var(--sp-2); margin: 0 0 var(--sp-3); }
+.subagent-approvals { display: flex; flex-direction: column; gap: var(--sp-2); margin: var(--sp-3) 0 0; }
 .subagent-card .ticon { display: inline-flex; color: var(--purple); flex: 0 0 auto; }
 .subagent-card .sub-spacer { flex: 1; }
 .subagent-card .sub-steps { font-size: 10.5px; font-weight: 500; color: var(--fg-faint); }

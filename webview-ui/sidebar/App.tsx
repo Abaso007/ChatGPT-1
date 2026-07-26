@@ -482,13 +482,6 @@ function SubagentChat({
           </button>
         )}
       </div>
-      {pinnedApprovals.length > 0 && (
-        <div className="subagent-approvals">
-          {pinnedApprovals.map((r) => (
-            <ApprovalCard key={r.requestId} request={r} />
-          ))}
-        </div>
-      )}
       <div className="msg user subagent-task-msg">
         <div className="role"><Icon name="task" /> Task</div>
         {taskPrompt ? (
@@ -530,6 +523,13 @@ function SubagentChat({
           )}
           {running && (
             <div className="phase-row"><span className="phase-shimmer">Working</span></div>
+          )}
+          {pinnedApprovals.length > 0 && (
+            <div className="subagent-approvals">
+              {pinnedApprovals.map((r) => (
+                <ApprovalCard key={r.requestId} request={r} />
+              ))}
+            </div>
           )}
           {!running && block.result && (
             <div className="sub-summary">
