@@ -49,7 +49,6 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   /** Persona selected for the next new conversation (overrides the global default). */
   private _pendingPersonaId?: string;
   /** Original ("before") file contents keyed by path, for the diff virtual-doc provider. */
-  public readonly _originalDocs = new Map<string, string>();
   /** Ids of locally-pulled Ollama models (for routing without a provider entry). */
   private _ollamaModelIds = new Set<string>();
   /** Map fetched model id -> provider id that served it (for exact routing). */
@@ -424,19 +423,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       return;
     }
     try {
-      const folders = vscode.workspace.workspaceFolders;
-      const base = folders && folders.length > 0 ? folders[0].uri : undefined;
-      const isAbsolute = /^([a-zA-Z]:[\\/]|\/)/.test(relPath);
-      const fileUri = isAbsolute ? vscode.Uri.file(relPath) : base ? vscode.Uri.joinPath(base, relPath) : vscode.Uri.file(relPath);
-      // Virtual document for the "before" side.
-      const beforeUri = vscode.Uri.parse(`ocursor-original:${relPath}`);
-      this._originalDocs.set(relPath, change.before);
-      await vscode.commands.executeCommand(
-        "vscode.diff",
-        beforeUri,
-        fileUri,
-        `${relPath.split(/[\\/]/).pop()} (changes)`
-      );
+      // Single shared diff view (see inlineReview) so a file never ends up with
+      // two competing diff tabs.
+      await vscode.commands.executeCommand("ocursor.viewDiff", relPath);
     } catch (err: any) {
       vscode.window.showErrorMessage(`OpenCursor: Could not show diff: ${err?.message}`);
     }

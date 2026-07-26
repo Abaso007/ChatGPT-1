@@ -74,16 +74,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   );
 
-  // Virtual-doc provider serving the "before" side of agent-edit diffs.
-  context.subscriptions.push(
-    vscode.workspace.registerTextDocumentContentProvider("ocursor-original", {
-      provideTextDocumentContent(uri) {
-        return sidebarProvider._originalDocs.get(uri.path) ?? "";
-      },
-    })
-  );
-
-  // Inline (in-editor) Keep/Undo CodeLenses + changed-line decorations (no git needed).
+  // Inline diff view for agent edits + changed-line decorations (no git needed).
   registerInlineReview(context);
 
   context.subscriptions.push(
