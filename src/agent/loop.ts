@@ -725,18 +725,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				const tMs = call.name.startsWith("mcp__")
 					? toolTimeoutMs("CallMcpTool")
 					: toolTimeoutMs(call.name);
-				// Shell: countdown uses block_until_ms when shorter than tool budget.
+				// Shell foreground expiry backgrounds the command; it is not the tool's
+				// hard timeout. Keep the outer safety budget so cleanup can return smoothly.
 				let timeoutMs = tMs > 0 ? tMs : undefined;
-				if ((call.name === "Shell" || call.name === "AwaitShell") && !badArgs) {
-					const raw = typeof input?.block_until_ms === "number" ? input.block_until_ms : undefined;
-					if (raw !== undefined && raw > 0) {
-						const block = Math.min(raw, call.name === "Shell" ? 30_000 : 45_000);
-						timeoutMs = timeoutMs ? Math.min(timeoutMs, block) : block;
-					} else if (call.name === "Shell" && (raw === undefined || raw === null)) {
-						// Default foreground shell wait.
-						timeoutMs = timeoutMs ? Math.min(timeoutMs, 15_000) : 15_000;
-					}
-				}
 				// Task: no outer timeout — nested tool calls already time out individually.
 				// Announce card; startedAt set when exec actually begins.
 				emit({

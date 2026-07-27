@@ -279,7 +279,8 @@ export const listDirTool = defineTool("ListDir", false, async (input, abortSigna
 		if (abortSignal?.aborted) return { output: "error: aborted" };
 		let p: string;
 		try {
-			p = safePath(input.path ?? ".");
+			const pathInput = typeof input.path === "string" && input.path.trim() ? input.path : ".";
+			p = safePath(pathInput);
 		} catch (e) {
 			return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
 		}

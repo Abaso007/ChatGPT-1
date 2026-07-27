@@ -339,13 +339,9 @@ export function isToolCountdownActive(block: ToolBlock): boolean {
   return block.status === "running";
 }
 
-/** Dedup kill-at-zero across multiple countdown mounts (explore head + card). */
-const firedTimeouts = new Set<string>();
-
 /**
- * Live countdown for a running tool/task. At 0: cancel/kill via host.
- * Uses host `startedAt` when present; otherwise starts the clock on first
- * observation so every timed tool always shows a countdown.
+ * Live display of the extension host's timeout deadline. The host exclusively
+ * owns cancellation so webview timer throttling cannot race tool completion.
  */
 export function useToolCountdown(block: ToolBlock): number | null {
   const budget = block.timeoutMs && block.timeoutMs > 0 ? block.timeoutMs : 0;
@@ -363,20 +359,11 @@ export function useToolCountdown(block: ToolBlock): number | null {
     // Prefer host clock; fall back to first UI observation of this run.
     if (hostStarted) localStart.current = hostStarted;
     else if (!localStart.current) localStart.current = Date.now();
-    // Allow re-fire only on a brand-new callId (set already cleared on settle).
-    if (block.status !== "running" && !(block.name === "Task" || block.name === "task")) {
-      firedTimeouts.delete(block.callId);
-    }
-
     const tick = () => {
       const start = hostStarted || localStart.current;
       if (!start) return;
       const sec = Math.max(0, Math.ceil((start + budget - Date.now()) / 1000));
       setLeft(sec);
-      if (sec <= 0 && !firedTimeouts.has(block.callId)) {
-        firedTimeouts.add(block.callId);
-        post({ type: "cancelSubagent", callId: block.callId, reason: "timeout" });
-      }
     };
     tick();
     const id = window.setInterval(tick, 250);
@@ -396,7 +383,7 @@ function formatCountdown(sec: number): string {
   return `${sec}s`;
 }
 
-/** Visible countdown badge; also drives kill-at-zero via useToolCountdown. */
+/** Visible countdown badge for the host-owned deadline. */
 export function TimeoutBadge({ block }: { block: ToolBlock }) {
   const left = useToolCountdown(block);
   if (left == null) return null;
@@ -404,14 +391,14 @@ export function TimeoutBadge({ block }: { block: ToolBlock }) {
   return (
     <span
       className={"tool-timeout" + (urgent ? " urgent" : "") + (left === 0 ? " zero" : "")}
-      title="Timeout remaining — tool is killed at 0"
+      title="Timeout remaining — enforced by the extension host"
     >
       {left === 0 ? "timeout" : formatCountdown(left)}
     </span>
   );
 }
 
-/** Silent countdown (kill at 0) without rendering — for collapsed explore groups. */
+/** Silent countdown state update for collapsed explore groups. */
 export function ToolTimeoutWatch({ block }: { block: ToolBlock }) {
   useToolCountdown(block);
   return null;

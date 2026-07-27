@@ -40,33 +40,32 @@ export {
 export const TOOL_TIMEOUT_MS: Record<string, number> = {
   // Outer safety net: slightly above each tool's own cap so the tool can
   // clean up (kill process / mark done) before the loop aborts it.
-  Shell: 45_000,
-  AwaitShell: 60_000,
-  Grep: 20_000,
-  Glob: 20_000,
-  FileSearch: 15_000,
-  SemanticSearch: 30_000,
-  SearchDocs: 25_000,
-  ListDir: 10_000,
-  // Inner Read has 3s stat + 12s I/O; outer net must be slightly above.
-  Read: 15_000,
-  ReadLints: 15_000,
-  WebSearch: 20_000,
-  WebFetch: 25_000,
-  StrReplace: 20_000,
-  Write: 20_000,
-  Delete: 10_000,
-  EditNotebook: 20_000,
-  CallMcpTool: 45_000,
-  FetchMcpResource: 30_000,
-  ListMcpResources: 15_000,
-  TodoWrite: 15_000,
-  TodoRead: 15_000,
-  WritePlan: 10_000,
-  SwitchMode: 5_000,
+  Shell: 120_000,
+  AwaitShell: 300_000,
+  Grep: 120_000,
+  Glob: 120_000,
+  FileSearch: 120_000,
+  SemanticSearch: 300_000,
+  SearchDocs: 300_000,
+  ListDir: 60_000,
+  Read: 300_000,
+  ReadLints: 300_000,
+  WebSearch: 300_000,
+  WebFetch: 300_000,
+  StrReplace: 300_000,
+  Write: 300_000,
+  Delete: 60_000,
+  EditNotebook: 300_000,
+  CallMcpTool: 180_000,
+  FetchMcpResource: 120_000,
+  ListMcpResources: 120_000,
+  TodoWrite: 120_000,
+  TodoRead: 120_000,
+  WritePlan: 300_000,
+  SwitchMode: 60_000,
 };
 /** Default when a tool has no explicit entry. */
-export const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
+export const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
 /** Tools that manage their own lifetime. Task has no outer budget — nested tools already time out. */
 export const NO_TOOL_TIMEOUT = new Set(["AskQuestion", "Task"]);
 
@@ -412,13 +411,15 @@ export interface ShellSession {
   /** Serializes command execution so output framing stays intact. */
   queue: Promise<unknown>;
   buffer: string;
+  closed: boolean;
+  error?: string;
 }
 
 const shellSessions = new Map<string, ShellSession>();
 
 function spawnSessionShell(cwd: string): ChildProcess {
   if (process.platform === "win32") {
-    // -File - reads stdin as a script; NonInteractive avoids prompts that hang.
+    // Read command frames from stdin; NonInteractive avoids host prompts.
     return spawn(
       "powershell.exe",
       ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "-"],
@@ -436,7 +437,7 @@ function spawnSessionShell(cwd: string): ChildProcess {
 /** Get (or lazily create) the persistent shell session for a run key. */
 export function getShellSession(key: string, cwd: string): ShellSession {
   let s = shellSessions.get(key);
-  if (s && !s.proc.killed && s.proc.exitCode === null && s.proc.stdin && !s.proc.stdin.destroyed) {
+  if (s && !s.closed && !s.proc.killed && s.proc.exitCode === null && s.proc.stdin && !s.proc.stdin.destroyed && s.proc.stdin.writable) {
     return s;
   }
   if (s) {
@@ -444,7 +445,7 @@ export function getShellSession(key: string, cwd: string): ShellSession {
     shellSessions.delete(key);
   }
   const proc = spawnSessionShell(cwd);
-  s = { proc, queue: Promise.resolve(), buffer: "" };
+  s = { proc, queue: Promise.resolve(), buffer: "", closed: false };
   proc.stdout?.on("data", (d) => {
     try { s!.buffer += d.toString(); } catch { /* ignore */ }
   });
@@ -452,12 +453,18 @@ export function getShellSession(key: string, cwd: string): ShellSession {
     try { s!.buffer += d.toString(); } catch { /* ignore */ }
   });
   proc.on("error", (error) => {
+    s!.error = error.message;
+    s!.closed = true;
     s!.buffer += `\n(shell process error: ${error.message})`;
   });
   proc.on("exit", (code, signal) => {
+    s!.closed = true;
     if (code !== 0 || signal) {
       s!.buffer += `\n(shell process exited${code == null ? "" : ` with code ${code}`}${signal ? ` from signal ${signal}` : ""})`;
     }
+  });
+  proc.on("close", () => {
+    s!.closed = true;
   });
   // Prevent unhandled 'error' on stdin from crashing the extension host.
   proc.stdin?.on("error", () => { /* ignore broken pipe */ });
@@ -466,15 +473,14 @@ export function getShellSession(key: string, cwd: string): ShellSession {
 }
 
 /** Tear down a run's persistent shell session (call on run end / dispose). */
-export function disposeShellSession(key: string): void {
+export function disposeShellSession(key: string, expected?: ShellSession): void {
   const s = shellSessions.get(key);
-  if (s) {
-    try {
-      if (process.platform === "win32") s.proc.kill();
-      else s.proc.kill("SIGKILL");
-    } catch { /* ignore */ }
-    shellSessions.delete(key);
-  }
+  if (!s || (expected && s !== expected)) return;
+  try {
+    if (process.platform === "win32") s.proc.kill();
+    else s.proc.kill("SIGKILL");
+  } catch { /* ignore */ }
+  shellSessions.delete(key);
 }
 
 /** Detach a busy session so later commands get a fresh shell while it finishes. */
@@ -497,13 +503,7 @@ export function waitForShell(sh: BgShell, ms: number, pattern?: RegExp, signal?:
       signal?.removeEventListener("abort", onAbort);
       resolve();
     };
-    const onAbort = () => {
-      if (!sh.done) {
-        sh.output += "\n(aborted)";
-        sh.done = true;
-      }
-      finish();
-    };
+    const onAbort = () => finish();
     if (signal?.aborted) {
       onAbort();
       return;
@@ -561,7 +561,8 @@ export function renderShell(sh: BgShell): string {
   const elapsed = Date.now() - sh.startedAt;
   // Trim trailing blank lines the shell echoes; collapse >2 blank lines and
   // runs of identical lines (progress spinners, repeated warnings).
-  const cleaned = collapseRepeats(sh.output.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trimEnd());
+  const withoutProtocol = sh.output.replace(/(?:^|\r?\n)__OC_SHELL_DONE___sh_\d+_[a-z0-9]+:-?\d+(?=\r?\n|$)/gm, "");
+  const cleaned = collapseRepeats(withoutProtocol.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trimEnd());
   const body = clampMiddle(cleaned, 12000);
   if (sh.done) {
     // Completed: the model only needs output + exit code. Drop pid/running_for_ms.
