@@ -19,7 +19,7 @@ import { effectiveContextLength, ensureLoaded, isRunning, serverUrlFor } from ".
 import * as ollama from "../agent/ollama";
 import * as oauth from "../agent/oauth";
 import { recordUsage } from "../stores/usageStore";
-import { DEFAULT_APPROVAL, evaluateApproval, actionTypeForCall, subjectFor, type ApprovalActionType, type ApprovalMode, type ApprovalPolicy } from "../agent/approvalPolicy";
+import { DEFAULT_APPROVAL, evaluateApproval, deniedSubject, actionTypeForCall, subjectFor, type ApprovalActionType, type ApprovalMode, type ApprovalPolicy } from "../agent/approvalPolicy";
 import { stripModelScope, suggestPattern } from "./sidebar/approvalSuggest";
 import type { PendingApproval, RunSession } from "./sidebar/session";
 import { runHooks, runBlockingHooks } from "../integrations/hooksRunner";
@@ -785,8 +785,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     if (decision === "allow") return true;
     const type = actionTypeForCall(toolName, input, getWorkspaceRoot())!;
     if (decision === "deny") {
-      const subject = subjectFor(type, toolName, input);
-      return type === "shell" ? { approved: false, blockedSubject: subject.trim().split(/\s+/)[0] || toolName } : false;
+      // Report the chained command that actually tripped the rule, not the first
+      // one on the line (`git add -A; git commit` must name `git commit`).
+      const blocked = deniedSubject(this._approvalPolicy(), toolName, input, getWorkspaceRoot());
+      return type === "shell" ? { approved: false, blockedSubject: blocked || subjectFor(type, toolName, input) || toolName } : false;
     }
 
     const subject = subjectFor(type, toolName, input);
@@ -829,11 +831,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /** The effective approval policy (user settings over safe defaults). */
+  private _approvalPolicy(): ApprovalPolicy {
+    return { ...DEFAULT_APPROVAL, ...(this.featureStore.get().approvalPolicy ?? {}) };
+  }
+
   /** Evaluate the current approval policy for a tool call. */
   private _evaluatePolicy(toolName: string, input: any): "allow" | "ask" | "deny" {
-    const features = this.featureStore.get();
-    const policy: ApprovalPolicy = { ...DEFAULT_APPROVAL, ...(features.approvalPolicy ?? {}) };
-    return evaluateApproval(policy, toolName, input, getWorkspaceRoot());
+    return evaluateApproval(this._approvalPolicy(), toolName, input, getWorkspaceRoot());
   }
 
   /** Handle the webview's decision on a pending approval (optionally updating global policy). */
