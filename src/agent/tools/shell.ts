@@ -18,6 +18,10 @@ import {
   getShellSession,
   disposeShellSession,
   detachShellSession,
+  nextShellMarker,
+  markerRe,
+  buildSessionScript,
+  submitToSession,
   type BgShell,
   type ShellNotify,
 } from "./shared";
@@ -49,8 +53,30 @@ function buildNotify(input: any, ctx: any): ShellNotify | undefined {
   };
 }
 
+/**
+ * Stream the rendered card to the UI while the command runs, throttled so a
+ * chatty build can't flood the webview.
+ */
+function makeLiveStream(sh: BgShell, callId: string | undefined, ctx: any): (() => void) | undefined {
+  const emit = ctx?.emitToolProgress;
+  if (!emit || !callId) return undefined;
+  let last = 0;
+  let timer: NodeJS.Timeout | undefined;
+  const send = () => {
+    last = Date.now();
+    timer = undefined;
+    try { emit(callId, renderShell(sh)); } catch { /* ignore */ }
+  };
+  return () => {
+    if (timer) return;
+    const wait = Math.max(0, 120 - (Date.now() - last));
+    timer = setTimeout(send, wait);
+    timer.unref?.();
+  };
+}
+
 // ---- Shell (stateful session; backgrounds a command past block_until_ms) ----
-export const runTerminalTool = defineTool("Shell", true, async (input, abortSignal, _callId, ctx) => {
+export const runTerminalTool = defineTool("Shell", true, async (input, abortSignal, callId, ctx) => {
   const root = getWorkspaceRoot();
   const requestedBlock = Number(input.block_until_ms);
   const rawBlock = Number.isFinite(requestedBlock) ? requestedBlock : DEFAULT_BLOCK_MS;
@@ -97,9 +123,25 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
     done: false,
     exitCode: null,
     startedAt: Date.now(),
+    status: "running",
+    cwd: session.cwd,
+    marker: nextShellMarker(),
     notify: buildNotify(input, ctx),
   };
   bgShells.set(sh.id, sh);
+  const live = makeLiveStream(sh, callId, ctx);
+  if (live) sh.onChunk = () => live();
+
+  /** Single place that settles a command so status/exit/timing stay consistent. */
+  const settle = (status: BgShell["status"], code: number | null, note?: string) => {
+    if (sh.done) return;
+    if (note) sh.output += `\n${note}`;
+    sh.exitCode = code;
+    sh.status = status;
+    sh.done = true;
+    sh.endedAt = Date.now();
+    live?.();
+  };
 
   const killSession = () => {
     try {
@@ -111,11 +153,7 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
     }
   };
   const onAbort = () => {
-    if (!sh.done) {
-      sh.output += "\n(aborted)";
-      sh.done = true;
-      sh.exitCode = sh.exitCode ?? 130;
-    }
+    settle("aborted", sh.exitCode ?? 130, "(aborted)");
     killSession();
   };
   abortSignal?.addEventListener("abort", onAbort);
@@ -126,20 +164,19 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
       cd = safePath(String(input.working_directory));
     } catch (e) {
       abortSignal?.removeEventListener("abort", onAbort);
-      sh.done = true;
-      sh.exitCode = 1;
+      settle("failed", 1);
       releaseQueue();
       return {
         output: `error: invalid working_directory: ${e instanceof Error ? e.message : String(e)}`,
       };
     }
   }
+  // A per-call cwd applies only to this command; the session keeps its own cwd.
   if (cd) {
-    disposeShellSession(sessionKey, session);
-    session = getShellSession(sessionKey, cd);
-    sh.proc = session.proc;
+    sh.cwd = cd;
   }
 
+  const doneRe = markerRe(sh.marker!);
   let lastSeen = session.buffer.length;
   sh.pump = () => {
     try {
@@ -147,43 +184,34 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
         pushShellOutput(sh, session.buffer.slice(lastSeen));
         lastSeen = session.buffer.length;
       }
-      if (!sh.done && (session.closed || session.proc.killed || session.proc.exitCode != null)) {
-        sh.exitCode = session.proc.exitCode ?? 0;
-        sh.done = true;
-        if (session.error) sh.output += `\n(shell session failed: ${session.error})`;
+      if (!sh.done) {
+        // Completion marker written by the session protocol carries the exit code.
+        const m = doneRe.exec(sh.output);
+        if (m) {
+          const code = Number(m[1]);
+          settle(code === 0 ? "completed" : "failed", Number.isFinite(code) ? code : 1);
+          return;
+        }
+        if (session.closed || session.proc.killed || session.proc.exitCode != null) {
+          const code = session.proc.exitCode ?? 1;
+          settle(
+            code === 0 ? "completed" : "failed",
+            code,
+            session.error ? `(shell session failed: ${session.error})` : undefined,
+          );
+        }
       }
     } catch (e) {
-      if (!sh.done) {
-        sh.done = true;
-        sh.exitCode = 1;
-        sh.output += `\n(pump error: ${e instanceof Error ? e.message : String(e)})`;
-      }
+      settle("failed", 1, `(pump error: ${e instanceof Error ? e.message : String(e)})`);
     }
   };
 
+  const script = buildSessionScript(command, sh.marker!, cd || undefined);
   try {
-    const stdin = session.proc.stdin;
-    if (!stdin || stdin.destroyed || !stdin.writable) {
-      throw new Error("shell stdin is not writable");
-    }
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const finish = (error?: Error | null) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        stdin.removeListener("error", onError);
-        error ? reject(error) : resolve();
-      };
-      const onError = (error: Error) => finish(error);
-      const timer = setTimeout(() => finish(new Error("shell write did not complete within 5s")), 5_000);
-      stdin.once("error", onError);
-      stdin.end(command, () => finish());
-    });
+    await submitToSession(session, script);
   } catch (e) {
     abortSignal?.removeEventListener("abort", onAbort);
-    sh.done = true;
-    sh.exitCode = 1;
+    settle("failed", 1);
     killSession();
     releaseQueue();
     return {
@@ -204,11 +232,10 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
 
     // Abort/timeout: kill session immediately so the loop is free.
     if (abortSignal?.aborted && !sh.done) {
-      sh.output += "\n(aborted / timed out)";
-      sh.done = true;
-      sh.exitCode = sh.exitCode ?? 124;
+      settle("aborted", sh.exitCode ?? 130, "(aborted / timed out)");
       killSession();
     } else if (!sh.done) {
+      sh.status = "backgrounded";
       // Foreground expiry is not command failure. Keep capturing delayed stderr
       // (including endpoint-security diagnostics) and let AwaitShell observe it.
       detachShellSession(sessionKey, session);
@@ -224,9 +251,7 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
       // queue forever. Reset only after the background lifetime expires.
       setTimeout(() => {
         if (!sh.done) {
-          sh.output += "\n(background limit reached after 10m — shell session reset)";
-          sh.done = true;
-          sh.exitCode = sh.exitCode ?? 124;
+          settle("timeout", sh.exitCode ?? 124, "(background limit reached after 10m — shell session reset)");
           try {
             if (isWin) session.proc.kill();
             else session.proc.kill("SIGKILL");
@@ -240,11 +265,7 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
 
     return { output: renderShell(sh) };
   } catch (e) {
-    if (!sh.done) {
-      sh.done = true;
-      sh.exitCode = 1;
-      sh.output += `\n(error: ${e instanceof Error ? e.message : String(e)})`;
-    }
+    settle("failed", 1, `(error: ${e instanceof Error ? e.message : String(e)})`);
     killSession();
     return { output: renderShell(sh) };
   } finally {
@@ -254,7 +275,7 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
 });
 
 // ---- AwaitShell (poll a backgrounded shell, or just sleep) ----
-export const awaitShellTool = defineTool("AwaitShell", false, async (input, abortSignal) => {
+export const awaitShellTool = defineTool("AwaitShell", false, async (input, abortSignal, callId, ctx) => {
   const requestedBlock = Number(input?.block_until_ms);
   const raw = Number.isFinite(requestedBlock) ? requestedBlock : 15_000;
   const blockMs = raw <= 0 ? 0 : Math.min(raw, MAX_AWAIT_MS);
@@ -297,6 +318,14 @@ export const awaitShellTool = defineTool("AwaitShell", false, async (input, abor
     }
   }
 
+  const prevChunk = sh.onChunk;
+  const live = makeLiveStream(sh, callId, ctx);
+  if (live) {
+    sh.onChunk = (chunk) => {
+      try { prevChunk?.(chunk); } catch { /* ignore */ }
+      live();
+    };
+  }
   try {
     await waitForShell(sh, blockMs, pattern, abortSignal);
     try {
@@ -309,5 +338,7 @@ export const awaitShellTool = defineTool("AwaitShell", false, async (input, abor
     return {
       output: `error: AwaitShell failed: ${e instanceof Error ? e.message : String(e)}`,
     };
+  } finally {
+    sh.onChunk = prevChunk;
   }
 });

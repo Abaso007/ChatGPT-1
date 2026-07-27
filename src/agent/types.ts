@@ -76,6 +76,8 @@ export type AgentEvent =
   | { type: "tool-call-started"; callId: string; name: string; input: unknown; timeoutMs?: number; startedAt?: number }
   // Live JSON-arg streaming for a started call (UI parses partial input).
   | { type: "tool-call-args"; callId: string; argsText: string }
+  // Partial output of a still-running tool (live shell output).
+  | { type: "tool-call-progress"; callId: string; text: string }
   | { type: "tool-call-completed"; callId: string; name: string; status: "completed" | "error"; result: string; diff?: string; startLine?: number; endLine?: number }
   | { type: "run-status"; status: "running" | "finished" | "error" | "cancelled" }
   | { type: "usage"; promptTokens: number; completionTokens: number; totalTokens: number }

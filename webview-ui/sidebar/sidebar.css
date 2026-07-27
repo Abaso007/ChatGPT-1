@@ -521,6 +521,20 @@ body {
 }
 .shell-footer.ok { color: var(--green, #3c9); }
 .shell-footer.err { color: var(--error, #e55); }
+.shell-footer { display: flex; align-items: center; gap: 5px; }
+.shell-footer svg { width: 11px; height: 11px; flex: 0 0 auto; }
+/* Live output: blinking caret at the tail of the stream. */
+.term-caret {
+  display: inline-block;
+  width: 7px;
+  height: 12px;
+  margin-left: 1px;
+  vertical-align: text-bottom;
+  background: var(--terminal-fg, currentColor);
+  opacity: 0.8;
+  animation: term-blink 1s steps(2, start) infinite;
+}
+@keyframes term-blink { to { visibility: hidden; } }
 .tool-card.shell-card .terminal-output {
   padding: 8px 10px;
   max-height: 280px;

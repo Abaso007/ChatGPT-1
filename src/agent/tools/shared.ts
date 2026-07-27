@@ -368,6 +368,9 @@ export interface ShellNotify {
   emit?: (text: string) => void;
 }
 
+/** Lifecycle state of a shell command (drives the footer the model/UI reads). */
+export type ShellStatus = "running" | "completed" | "failed" | "aborted" | "timeout" | "backgrounded";
+
 export interface BgShell {
   id: string;
   command: string;
@@ -376,9 +379,20 @@ export interface BgShell {
   done: boolean;
   exitCode: number | null;
   startedAt: number;
+  /** Wall-clock end (set once the command settles). */
+  endedAt?: number;
+  /** Directory the command ran in. */
+  cwd?: string;
+  status: ShellStatus;
+  /** Signal that killed the underlying process, when known. */
+  signal?: string;
+  /** Completion marker written by the session protocol for this command. */
+  marker?: string;
   notify?: ShellNotify;
   /** Pull any new session output into this shell's buffer (for polling). */
   pump?: () => void;
+  /** Live-output sink (streams the rendered card to the UI while running). */
+  onChunk?: (chunk: string) => void;
 }
 
 export const bgShells = new Map<string, BgShell>();
@@ -393,6 +407,7 @@ export function nextShellId(): string {
  */
 export function pushShellOutput(sh: BgShell, chunk: string): void {
   sh.output += chunk;
+  try { sh.onChunk?.(chunk); } catch { /* ignore */ }
   const n = sh.notify;
   if (!n || !n.emit) return;
   if (!n.re.test(chunk)) return;
@@ -413,6 +428,87 @@ export interface ShellSession {
   buffer: string;
   closed: boolean;
   error?: string;
+  /** Directory the session shell was started in. */
+  cwd: string;
+}
+
+const IS_WIN = process.platform === "win32";
+let markerSeq = 0;
+
+/** Unique completion marker for one command submitted to a session shell. */
+export function nextShellMarker(): string {
+  return `__OC_SHELL_DONE___m${++markerSeq}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Matches "<marker>:<exit code>" anywhere in the stream. */
+export function markerRe(marker: string): RegExp {
+  return new RegExp(`${marker}:(-?\\d+)`);
+}
+
+/**
+ * Wrap a user command so the session shell reports its exit status back on a
+ * marker line. The session stays alive (stdin is never closed), so cwd, env and
+ * shell variables persist across calls in the same run.
+ */
+export function buildSessionScript(command: string, marker: string, cwd?: string): string {
+  if (IS_WIN) {
+    return [
+      "$global:LASTEXITCODE = $null",
+      "$ErrorActionPreference = 'Continue'",
+      // A per-call working directory must not leak into the persistent session.
+      cwd ? `Push-Location -LiteralPath ${psQuote(cwd)}` : "",
+      command,
+      "$__oc = if ($LASTEXITCODE -ne $null) { $LASTEXITCODE } elseif ($?) { 0 } else { 1 }",
+      cwd ? "Pop-Location" : "",
+      `Write-Output ("\`n${marker}:" + $__oc)`,
+      "",
+    ]
+      .filter((l) => l !== "")
+      .join("\n");
+  }
+  return [
+    cwd ? `pushd ${shQuote(cwd)} >/dev/null` : "",
+    command,
+    "__oc_status=$?",
+    cwd ? "popd >/dev/null" : "",
+    `printf '\\n${marker}:%s\\n' "$__oc_status"`,
+    "",
+  ]
+    .filter((l) => l !== "")
+    .join("\n");
+}
+
+/** Single-quote a PowerShell literal. */
+function psQuote(s: string): string {
+  return `'${s.replace(/'/g, "''")}'`;
+}
+
+/** Single-quote a POSIX shell literal. */
+function shQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Write a command into a live session shell without closing its stdin. */
+export function submitToSession(session: ShellSession, script: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const stdin = session.proc.stdin;
+    if (!stdin || stdin.destroyed || !stdin.writable) {
+      reject(new Error("shell stdin is not writable"));
+      return;
+    }
+    let settled = false;
+    const finish = (error?: Error | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      stdin.removeListener("error", onError);
+      error ? reject(error) : resolve();
+    };
+    const onError = (error: Error) => finish(error);
+    const timer = setTimeout(() => finish(new Error("shell write did not complete within 5s")), 5_000);
+    stdin.once("error", onError);
+    stdin.write(script, (err) => finish(err));
+  });
 }
 
 const shellSessions = new Map<string, ShellSession>();
@@ -443,7 +539,7 @@ export function getShellSession(key: string, cwd: string): ShellSession {
     shellSessions.delete(key);
   }
   const proc = spawnSessionShell(cwd);
-  s = { proc, queue: Promise.resolve(), buffer: "", closed: false };
+  s = { proc, queue: Promise.resolve(), buffer: "", closed: false, cwd };
   proc.stdout?.on("data", (d) => {
     try { s!.buffer += d.toString(); } catch { /* ignore */ }
   });
@@ -555,20 +651,45 @@ function collapseRepeats(s: string): string {
   return out.join("\n");
 }
 
+/** Strip the session completion protocol out of user-visible output. */
+export function stripShellProtocol(s: string): string {
+  return s.replace(/^.*__OC_SHELL_DONE__\w+:-?\d+.*$\r?\n?/gm, "");
+}
+
+/** Human-readable label for a settled shell status. */
+function statusLabel(sh: BgShell): string {
+  switch (sh.status) {
+    case "completed":
+      return "success";
+    case "failed":
+      return "failed";
+    case "aborted":
+      return "aborted";
+    case "timeout":
+      return "timed out";
+    case "backgrounded":
+      return "backgrounded";
+    default:
+      return "running";
+  }
+}
+
 export function renderShell(sh: BgShell): string {
-  const elapsed = Date.now() - sh.startedAt;
+  const elapsed = (sh.endedAt ?? Date.now()) - sh.startedAt;
   // Trim trailing blank lines the shell echoes; collapse >2 blank lines and
   // runs of identical lines (progress spinners, repeated warnings).
-  const withoutProtocol = sh.output.replace(/(?:^|\r?\n)__OC_SHELL_DONE___sh_\d+_[a-z0-9]+:-?\d+(?=\r?\n|$)/gm, "");
-  const cleaned = collapseRepeats(withoutProtocol.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trimEnd());
+  const cleaned = collapseRepeats(
+    stripShellProtocol(sh.output).replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trimEnd(),
+  );
   const body = clampMiddle(cleaned, 12000);
   if (sh.done) {
-    // Completed: the model only needs output + exit code. Drop pid/running_for_ms.
-    const status = sh.exitCode === 0 ? "" : ` (exit ${sh.exitCode})`;
-    return `${body || "(no output)"}\n[done${status} in ${elapsed}ms]`;
+    const code = sh.exitCode ?? 0;
+    const sig = sh.signal ? ` signal=${sh.signal}` : "";
+    // Footer keeps a machine-readable exit_code (the UI colors the card from it).
+    return `${body || "(no output)"}\n(exit_code=${code}${sig} ${statusLabel(sh)} in ${elapsed}ms)`;
   }
   // Still running: keep the poll hint + id so the model can await it.
-  const head = `[shell ${sh.id}] running_for_ms=${elapsed}`;
+  const head = `[shell ${sh.id}] running_for_ms=${elapsed}${sh.cwd ? ` cwd=${sh.cwd}` : ""}`;
   return `${head}\n${body}\n(still running - poll with AwaitShell shell_id="${sh.id}")`;
 }
 

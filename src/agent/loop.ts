@@ -120,6 +120,13 @@ function coalesceEmit(raw: (e: AgentEvent) => void): (e: AgentEvent) => void {
 			schedule(policy.intervalMs);
 			return;
 		}
+		if (event.type === "tool-call-progress") {
+			// Latest snapshot wins; live shell output can arrive far faster than
+			// the UI can paint.
+			pending.set(`prog:${event.callId}`, event);
+			schedule(150);
+			return;
+		}
 		if (event.type === "subagent-event") {
 			const child = event.event;
 			// Coalesce nested high-freq child stream events per parent call.
@@ -194,6 +201,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		shellSessionKey,
 		getMode: () => mode,
 		emitShellNotify: (message) => emit({ type: "shell-notify", message }),
+		emitToolProgress: (callId, text) => emit({ type: "tool-call-progress", callId, text }),
 	};
 	toolCtx.switchMode = (next) => {
 		if (next === mode) {

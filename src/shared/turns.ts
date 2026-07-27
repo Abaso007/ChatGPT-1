@@ -18,6 +18,7 @@ export type AgentEvent =
   | { type: "thinking-delta"; text: string }
   | { type: "tool-call-started"; callId: string; name: string; input: any; timeoutMs?: number; startedAt?: number }
   | { type: "tool-call-args"; callId: string; argsText: string }
+  | { type: "tool-call-progress"; callId: string; text: string }
   | {
       type: "tool-call-completed";
       callId: string;
@@ -239,6 +240,13 @@ export function applyToBlocks(blocksIn: AssistantBlock[], ev: AgentEvent): Assis
     if (input === b.input) return blocksIn;
     blocks[i] = { ...b, input };
     return blocks;
+  } else if (ev.type === "tool-call-progress") {
+    const i = findToolIndex(blocks, ev.callId);
+    if (i < 0) return blocksIn;
+    const b = blocks[i] as ToolBlock;
+    if (b.status !== "running" || b.result === ev.text) return blocksIn;
+    blocks[i] = { ...b, result: ev.text };
+    return blocks;
   } else if (ev.type === "tool-call-completed") {
     const i = findToolIndex(blocks, ev.callId);
     if (i < 0) return blocksIn;
@@ -367,6 +375,17 @@ export function applyEvent(turns: Turn[], ev: AgentEvent): Turn[] {
     const input = parsePartialArgs(ev.argsText, b.input);
     if (input === b.input) return turns;
     turn.blocks[i] = { ...b, input };
+    return list;
+  }
+
+  if (ev.type === "tool-call-progress") {
+    const i = lastIndexOfTool(turns, ev.callId);
+    if (i < 0) return turns;
+    const prev = (turns[turns.length - 1] as AssistantTurn).blocks[i] as ToolBlock;
+    // Never overwrite a settled result with a late progress frame.
+    if (prev.status !== "running" || prev.result === ev.text) return turns;
+    const { list, turn } = ensureAssistant(turns);
+    turn.blocks[i] = { ...prev, result: ev.text };
     return list;
   }
 

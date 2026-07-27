@@ -677,17 +677,7 @@ function ToolCardInner({ block, onImplement, onOpenSubagent, awaitingApproval }:
             // Stream the code as the model writes it; swapped for the diff on completion.
             <pre className="tool-result streaming">{editPreview(block.name, i) || "Writing…"}</pre>
           ) : isShell && shellParsed ? (
-            <div className="shell-body">
-              {shellParsed.meta ? <div className="shell-meta">{shellParsed.meta}</div> : null}
-              <pre className="terminal-output">
-                {shellParsed.body || (block.status === "running" ? "Running…" : "")}
-              </pre>
-              {shellParsed.footer ? (
-                <div className={"shell-footer" + (shellParsed.ok === false ? " err" : shellParsed.ok ? " ok" : "")}>
-                  {shellParsed.footer}
-                </div>
-              ) : null}
-            </div>
+            <TerminalBody parsed={shellParsed} running={block.status === "running"} />
           ) : (
             <pre className="tool-result">{block.status === "running" ? "Running…" : (block.result || "").slice(0, 4000)}</pre>
           )}
@@ -703,6 +693,37 @@ function ToolCardInner({ block, onImplement, onOpenSubagent, awaitingApproval }:
 export const ToolCard = React.memo(ToolCardInner, (a, b) =>
   a.block === b.block && a.onImplement === b.onImplement && a.onOpenSubagent === b.onOpenSubagent && a.awaitingApproval === b.awaitingApproval,
 );
+
+/** Terminal pane: streams live output and sticks to the bottom while running. */
+function TerminalBody({
+  parsed,
+  running,
+}: {
+  parsed: { meta: string; body: string; footer: string; ok: boolean | null };
+  running: boolean;
+}) {
+  const ref = React.useRef<HTMLPreElement>(null);
+  React.useEffect(() => {
+    if (!running) return;
+    const el = ref.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [parsed.body, running]);
+  return (
+    <div className={"shell-body" + (running ? " live" : "")}>
+      {parsed.meta ? <div className="shell-meta">{parsed.meta}</div> : null}
+      <pre className={"terminal-output" + (running ? " streaming" : "")} ref={ref}>
+        {parsed.body || (running ? "Running…" : "")}
+        {running ? <span className="term-caret" /> : null}
+      </pre>
+      {parsed.footer ? (
+        <div className={"shell-footer" + (parsed.ok === false ? " err" : parsed.ok ? " ok" : "")}>
+          {parsed.ok === true ? <Icon name="check" size={11} /> : null}
+          <span>{parsed.footer}</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
 
 function CopyCommandButton({ command }: { command: string }) {
   const [copied, setCopied] = React.useState(false);

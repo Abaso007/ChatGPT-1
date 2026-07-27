@@ -1419,6 +1419,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         scheduleUi();
         return;
       }
+      if (ev.type === "tool-call-progress") {
+        uiPending.set(`prog:${ev.callId}`, { event, apply: true });
+        scheduleUi();
+        return;
+      }
       if (ev.type === "subagent-event") {
         const child = ev.event as SharedAgentEvent;
         if (child.type === "text-delta" || child.type === "thinking-delta" || child.type === "tool-call-args") {
