@@ -712,7 +712,11 @@ body {
 .subagent-card .sub-open-chev { color: var(--fg-faint); }
 .subagent-card .tchev { display: inline-flex; flex: 0 0 auto; color: var(--fg-faint); cursor: pointer; }
 /* Live step list while the subagent works */
-.subagent-steps { display: flex; flex-direction: column; gap: 2px; margin-top: var(--sp-3); padding-left: 28px; }
+.subagent-card .sub-model {
+  font-size: 10px; font-weight: 500; color: var(--fg-faint);
+  max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.subagent-steps { display: flex; flex-direction: column; gap: 2px; margin-top: var(--sp-2); padding-left: 28px; }
 .subagent-step { display: flex; align-items: center; gap: var(--sp-2); font-size: 11px; font-weight: 400; color: var(--fg-dim); min-width: 0; }
 .subagent-step.muted { color: var(--fg-faint); }
 .subagent-step .step-icon { display: inline-flex; color: var(--fg-faint); flex: 0 0 auto; }

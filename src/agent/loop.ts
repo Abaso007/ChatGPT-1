@@ -231,6 +231,15 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				return availableModels.some((m) => m.toLowerCase() === id.toLowerCase()) ? id : undefined;
 			};
 			const subModel = known(opts?.model) || known(def?.model) || known(subagentModel) || model;
+			// Surface the resolved model on the Task card even when the call didn't name one.
+			if (callId) {
+				emit({
+					type: "tool-call-started",
+					callId,
+					name: "Task",
+					input: { model: subModel },
+				});
+			}
 			// Attach any provided files to the subagent prompt as context.
 			if (opts?.fileAttachments?.length) {
 				subPrompt = `${subPrompt}\n\n<attached_files>\n${opts.fileAttachments.join("\n")}\n</attached_files>`;

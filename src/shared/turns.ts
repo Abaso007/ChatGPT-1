@@ -184,6 +184,17 @@ export function parsePartialArgs(argsText: string, prev: unknown): unknown {
   }
 }
 
+/**
+ * Merge a later tool-call-started payload over the current input. Later frames
+ * can carry extra resolved fields (e.g. the subagent's model) without dropping
+ * what the model originally streamed.
+ */
+function mergeToolInput(prev: any, next: any): any {
+  if (!next || !Object.keys(next).length) return prev;
+  if (!prev || typeof prev !== "object" || !Object.keys(prev).length) return next;
+  return { ...prev, ...next };
+}
+
 /** Index of the tool block with `callId`, searched newest-first. */
 function findToolIndex(blocks: AssistantBlock[], callId: string): number {
   for (let i = blocks.length - 1; i >= 0; i--) {
@@ -217,7 +228,7 @@ export function applyToBlocks(blocksIn: AssistantBlock[], ev: AgentEvent): Assis
       blocks[existing] = {
         ...prev,
         name: ev.name,
-        input: Object.keys(ev.input || {}).length ? ev.input : prev.input,
+        input: mergeToolInput(prev.input, ev.input),
         timeoutMs: timeoutMs ?? prev.timeoutMs,
         startedAt: startedAt ?? prev.startedAt,
       } as AssistantBlock;
@@ -346,7 +357,7 @@ export function applyEvent(turns: Turn[], ev: AgentEvent): Turn[] {
       turn.blocks[existing] = {
         ...prev,
         name: ev.name,
-        input: Object.keys(ev.input || {}).length ? ev.input : prev.input,
+        input: mergeToolInput(prev.input, ev.input),
         status: "running",
         timeoutMs: timeoutMs ?? prev.timeoutMs,
         startedAt: startedAt ?? prev.startedAt,

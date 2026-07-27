@@ -228,7 +228,9 @@ function SubagentCard({ block, onOpen, awaitingApproval }: { block: ToolBlock; o
   // Live progress inline while it works; folds away once the subagent settles.
   const [open, toggleOpen] = useLiveDisclosure(running);
   const toolSteps = (block.subBlocks ?? []).filter((b): b is ToolBlock => b.kind === "tool");
-  const recent = toolSteps.slice(-6);
+  // Keep the card small: only the two most recent steps.
+  const recent = toolSteps.slice(-2);
+  const model = shortModelName(i.model);
 
   return (
     <div className={"subagent-card" + (awaitingApproval ? " needs-approval" : "")} onClick={() => onOpen?.(block.callId)} role="button" title="Open subagent">
@@ -246,17 +248,18 @@ function SubagentCard({ block, onOpen, awaitingApproval }: { block: ToolBlock; o
         <span className="ticon"><Icon name="task" /></span>
         <span className="label">{i.description || "Subagent"}</span>
         <span className="sub-spacer" />
+        {model ? <span className="sub-model" title={String(i.model)}>{model}</span> : null}
         <span className="sub-steps">{running ? `${steps} steps...` : `${steps} steps`}</span>
         <span className="badge badge-agent">{isReadonlySubagent(i) ? "Explore" : "Agent"}</span>
         {awaitingApproval ? <span className="badge badge-ask">Approve</span> : null}
         {running ? <span className="spinner" /> : <StatusIcon status={block.subStatus === "error" ? "error" : "completed"} />}
         <Icon name="chevR" size={14} className="sub-open-chev" />
       </div>
-      {subtitle && <div className="subagent-card-subtitle">{subtitle}</div>}
+      {subtitle && !open ? <div className="subagent-card-subtitle">{subtitle}</div> : null}
       {open && (
         <div className="subagent-steps">
           {recent.length === 0 ? (
-            <div className="subagent-step muted">{running ? "Starting…" : "No steps"}</div>
+            <div className="subagent-step muted">{subtitle || (running ? "Starting…" : "No steps")}</div>
           ) : (
             recent.map((s) => {
               const m = toolMeta(s.name, s.input || {});
@@ -273,6 +276,14 @@ function SubagentCard({ block, onOpen, awaitingApproval }: { block: ToolBlock; o
       )}
     </div>
   );
+}
+
+/** Compact model label: drop provider scope and any trailing version noise. */
+function shortModelName(model: unknown): string {
+  const raw = typeof model === "string" ? model.trim() : "";
+  if (!raw) return "";
+  const tail = raw.split("/").pop() || raw;
+  return tail.length > 24 ? tail.slice(0, 23) + "…" : tail;
 }
 
 // Human-readable "what is the subagent doing right now" line, derived from the
