@@ -41,7 +41,7 @@ export interface RunAgentOptions {
 	enableWorkspaceContext?: boolean;
 	enableWebSearch?: boolean;
 	enableWebFetch?: boolean;
-	approve?: (toolName: string, input: any, callId?: string) => Promise<boolean>;
+	approve?: (toolName: string, input: any, callId?: string) => Promise<boolean | { approved: false; blockedSubject: string }>;
 	isSubagent?: boolean;
 	customSubagents?: SubagentDef[];
 	/** Default model for subagents ("" = inherit this run's model). */

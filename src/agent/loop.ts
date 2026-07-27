@@ -790,8 +790,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					}
 					// Approval policy decides silently (allow/deny) or prompts (ask/review).
 					if (approve) {
-						const ok = await approve(call.name, input, call.id);
-						if (!ok) {
+						const approval = await approve(call.name, input, call.id);
+						if (approval !== true) {
 							results[i] = { status: "error", output: `user denied ${call.name}` };
 							return;
 						}
@@ -876,9 +876,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				// target paths outside the workspace.
 				const needsApproval = actionTypeForCall(call.name, input, getWorkspaceRoot()) !== undefined;
 				if (needsApproval && approve) {
-					const ok = await approve(call.name, input, call.id);
-					if (!ok) {
-						results[i] = { status: "error", output: `user denied ${call.name}; try a different approach or ask the user` };
+					const approval = await approve(call.name, input, call.id);
+					if (approval !== true) {
+						const denied = approval && typeof approval === "object"
+							? `user denied/blocked "${approval.blockedSubject}"`
+							: `user denied ${call.name}`;
+						results[i] = { status: "error", output: `${denied}; try a different approach or ask the user` };
 						return;
 					}
 				}

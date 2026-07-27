@@ -780,12 +780,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   }
 
   /** Ask for approval in the chat UI; resolves when the user decides (or the run aborts). */
-  private async _approveTool(convId: string, session: RunSession, toolName: string, input: any, callId?: string): Promise<boolean> {
+  private async _approveTool(convId: string, session: RunSession, toolName: string, input: any, callId?: string): Promise<boolean | { approved: false; blockedSubject: string }> {
     const decision = this._evaluatePolicy(toolName, input);
     if (decision === "allow") return true;
-    if (decision === "deny") return false;
-
     const type = actionTypeForCall(toolName, input, getWorkspaceRoot())!;
+    if (decision === "deny") {
+      const subject = subjectFor(type, toolName, input);
+      return type === "shell" ? { approved: false, blockedSubject: subject.trim().split(/\s+/)[0] || toolName } : false;
+    }
+
     const subject = subjectFor(type, toolName, input);
     const detail =
       type === "outside"
