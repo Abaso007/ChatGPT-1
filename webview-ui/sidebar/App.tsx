@@ -206,11 +206,12 @@ function ExploringSection({
   /** Pending approval requests keyed by tool callId (rendered on the tool card). */
   approvals?: Record<string, ApprovalRequestInfo>;
 }) {
-  const [open, setOpen] = React.useState(false);
+  const running = tools.some((t) => t.status === "running") || !!live;
+  // Expanded while exploring, collapsed into the summary once the group settles.
+  const [autoOpen, toggleOpen] = useLiveDisclosure(running);
   // A pending approval inside must be visible — force the section open.
   const hasApproval = !!approvals && tools.some((t) => t.callId && approvals[t.callId]);
-  React.useEffect(() => { if (hasApproval) setOpen(true); }, [hasApproval]);
-  const running = tools.some((t) => t.status === "running") || !!live;
+  const open = autoOpen || hasApproval;
   const current = [...tools].reverse().find((t) => t.status === "running") ?? tools[tools.length - 1];
   const subtitle = running ? capitalize(toolLabel(current.name)) : exploreSummary(tools);
   // Keep kill-at-zero active even when the group is collapsed (no ToolCard mount).
@@ -223,7 +224,7 @@ function ExploringSection({
       {timed.map((t) => (
         <ToolTimeoutWatch key={`watch-${t.callId}`} block={t} />
       ))}
-      <div className="explore-head" onClick={() => setOpen((o) => !o)}>
+      <div className="explore-head" onClick={toggleOpen}>
         <span className={"tchev" + (open ? " open" : "")}>
           <Icon name="chevD" size={12} />
         </span>
