@@ -184,7 +184,7 @@ function TodoList({ block }: { block: ToolBlock }) {
         <span className="label">Todos</span>
         <span className="right">
           <TimeoutBadge block={block} />
-          <StatusIcon status={block.status} />
+          <StatusIcon status={block.status} callId={block.callId} />
         </span>
       </div>
       <div className="todo-list">
@@ -226,33 +226,34 @@ function SubagentCard({ block, onOpen, awaitingApproval }: { block: ToolBlock; o
       ? subagentActivity(block.subBlocks)
       : undefined;
   // Live progress inline while it works; folds away once the subagent settles.
-  const [open, toggleOpen] = useLiveDisclosure(running);
+  // Steps follow the run itself — no manual disclosure on subagent cards.
+  const open = running;
   const toolSteps = (block.subBlocks ?? []).filter((b): b is ToolBlock => b.kind === "tool");
   // Keep the card small: only the two most recent steps.
   const recent = toolSteps.slice(-2);
   const model = shortModelName(i.model);
+  const statusKind = awaitingApproval
+    ? "approval"
+    : running
+      ? (i.run_in_background === true ? "background" : "running")
+      : block.subStatus === "error" || block.status === "error"
+        ? "error"
+        : block.subStatus === "cancelled"
+          ? "cancelled"
+          : "done";
 
   return (
     <div className={"subagent-card" + (awaitingApproval ? " needs-approval" : "")} onClick={() => onOpen?.(block.callId)} role="button" title="Open subagent">
       <div className="subagent-card-main">
-        <span
-          className={"tchev" + (open ? " open" : "")}
-          onClick={(e) => {
-            e.stopPropagation();
-            toggleOpen();
-          }}
-          title={open ? "Collapse steps" : "Expand steps"}
-        >
-          <Icon name="chevD" />
-        </span>
         <span className="ticon"><Icon name="task" /></span>
         <span className="label">{i.description || "Subagent"}</span>
         <span className="sub-spacer" />
-        {model ? <span className="sub-model" title={String(i.model)}>{model}</span> : null}
-        <span className="sub-steps">{running ? `${steps} steps...` : `${steps} steps`}</span>
+        <span className={"sub-status sub-status-" + statusKind}>{STATUS_LABELS[statusKind]}</span>
+        {model ? <span className="sub-chip sub-model" title={String(i.model)}>{model}</span> : null}
+        <span className="sub-chip sub-steps">{steps} {steps === 1 ? "step" : "steps"}</span>
         <span className="badge badge-agent">{isReadonlySubagent(i) ? "Explore" : "Agent"}</span>
         {awaitingApproval ? <span className="badge badge-ask">Approve</span> : null}
-        {running ? <span className="spinner" /> : <StatusIcon status={block.subStatus === "error" ? "error" : "completed"} />}
+        {running ? <RunningStop callId={block.callId} /> : <StatusIcon status={block.subStatus === "error" ? "error" : "completed"} />}
         <Icon name="chevR" size={14} className="sub-open-chev" />
       </div>
       {subtitle && !open ? <div className="subagent-card-subtitle">{subtitle}</div> : null}
@@ -267,16 +268,31 @@ function SubagentCard({ block, onOpen, awaitingApproval }: { block: ToolBlock; o
                 <div key={s.callId} className={"subagent-step " + s.status}>
                   <span className="step-icon"><Icon name={m.icon} size={11} /></span>
                   <span className="step-label" title={m.label}>{m.label || s.name}</span>
-                  {s.status === "running" ? <span className="spinner" /> : <StatusIcon status={s.status} />}
+                  <StatusIcon status={s.status} callId={s.callId} />
                 </div>
               );
             })
           )}
+          {recent.length > 0 && subtitle ? (
+            <div className="subagent-step activity">
+              <span className="step-icon"><span className="spinner" /></span>
+              <span className="step-label" title={subtitle}>{subtitle}</span>
+            </div>
+          ) : null}
         </div>
       )}
     </div>
   );
 }
+
+const STATUS_LABELS: Record<string, string> = {
+  approval: "Needs approval",
+  running: "Running",
+  background: "In background",
+  error: "Failed",
+  cancelled: "Stopped",
+  done: "Completed",
+};
 
 /** Compact model label: drop provider scope and any trailing version noise. */
 function shortModelName(model: unknown): string {
@@ -341,7 +357,7 @@ function PlanCard({ block, onImplement }: { block: ToolBlock; onImplement?: (pat
         <span className="plan-title">{title}</span>
         <TimeoutBadge block={block} />
         <span className="badge badge-plan">Plan</span>
-        <StatusIcon status={block.status} />
+        <StatusIcon status={block.status} callId={block.callId} />
       </div>
       {open && (
         <div className="plan-body">
@@ -390,9 +406,32 @@ export function useLiveDisclosure(live: boolean): [boolean, () => void] {
   return [open, toggle];
 }
 
-function StatusIcon({ status }: { status: ToolBlock["status"] }) {
-  if (status === "running") return <span className="spinner" />;
+function StatusIcon({ status, callId }: { status: ToolBlock["status"]; callId?: string }) {
+  if (status === "running") return <RunningStop callId={callId} />;
   return status === "completed" ? <Icon name="check" className="ok-icon" /> : <Icon name="close" className="err-icon" />;
+}
+
+/**
+ * Spinner that turns into a kill button on hover. The host registers an abort
+ * for every in-flight tool and subagent under its call id, so one message
+ * terminates any kind of running work.
+ */
+export function RunningStop({ callId }: { callId?: string }) {
+  if (!callId) return <span className="spinner" />;
+  return (
+    <span
+      className="spinner-stop"
+      role="button"
+      title="Stop this task"
+      onClick={(e) => {
+        e.stopPropagation();
+        post({ type: "cancelSubagent", callId, reason: "user" });
+      }}
+    >
+      <span className="spinner" />
+      <Icon name="close" className="stop-icon" size={11} />
+    </span>
+  );
 }
 
 /** True while this tool/task should show a live timeout countdown. */
@@ -528,7 +567,7 @@ export function ReadLine({ block }: { block: ToolBlock }) {
       <span className="rlines">{rangeTxt ? "L" + rangeTxt : ""}</span>
       <TimeoutBadge block={block} />
       <span className="rstatus">
-        <StatusIcon status={block.status} />
+        <StatusIcon status={block.status} callId={block.callId} />
       </span>
     </div>
   );
@@ -732,7 +771,7 @@ function ToolCardInner({ block, onImplement, onOpenSubagent, awaitingApproval }:
           {isShell && shellCmd ? <CopyCommandButton command={shellCmd} /> : null}
           <TimeoutBadge block={block} />
           {!isEdit && <span className={"badge " + meta.cls}>{meta.badge}</span>}
-          <StatusIcon status={block.status} />
+          <StatusIcon status={block.status} callId={block.callId} />
         </div>
       </div>
       {showBody && (

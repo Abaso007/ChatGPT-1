@@ -456,11 +456,9 @@ function parentTaskCallId(turns: Turn[], nestedCallId: string): string | undefin
 
 function SubagentChat({
   block,
-  onBack,
   approvals,
 }: {
   block: import("./types").ToolBlock;
-  onBack: () => void;
   approvals?: Record<string, ApprovalRequestInfo>;
 }) {
   const subDone = block.subStatus === "finished" || block.subStatus === "cancelled" || block.subStatus === "error";
@@ -472,17 +470,6 @@ function SubagentChat({
 
   return (
     <div className="subagent-view">
-      <div className="subagent-view-head">
-        <button className="sub-back" onClick={onBack}>
-          <Icon name="chevD" size={12} /> Back to chat
-        </button>
-        <span className="sub-readonly">{isReadonlySubagent(block.input) ? "read-only" : "agent"}</span>
-        {running && (
-          <button className="sub-stop" onClick={() => post({ type: "cancelSubagent", callId: block.callId, reason: "user" })}>
-            <Icon name="close" size={12} /> Stop
-          </button>
-        )}
-      </div>
       <div className="msg user subagent-task-msg">
         <div className="role"><Icon name="task" /> Task</div>
         {taskPrompt ? (
@@ -1458,7 +1445,7 @@ export function App() {
 
       <div className="chat-messages" ref={scrollRef} onScroll={onScroll}>
         {subBlock ? (
-          <SubagentChat block={subBlock} onBack={() => setSubTab(null)} approvals={approvalsByCall} />
+          <SubagentChat block={subBlock} approvals={approvalsByCall} />
         ) : !hasProviders ? (
           <div className="setup-screen">
             <img className="app-logo" src={document.getElementById("root")?.dataset.icon} alt="OpenCursor" />

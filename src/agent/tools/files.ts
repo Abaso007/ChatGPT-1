@@ -293,7 +293,9 @@ export const listDirTool = defineTool("ListDir", false, async (input, abortSigna
 		const shown = visible.slice(0, 300);
 		const extra = visible.length > shown.length ? `\n... (${visible.length - shown.length} more entries)` : "";
 		const out = shown.map((e) => (e.isDirectory() ? `${e.name}/` : e.name)).join("\n") || "(empty)";
-		return { output: out + extra };
+		// One short legend beats per-entry type labels: models otherwise treat a
+		// trailing "/" as cosmetic and try to Read directories.
+		return { output: `(trailing / = directory, no slash = file)\n${out}${extra}` };
 	} catch (e) {
 		return { output: `error: ListDir failed: ${e instanceof Error ? e.message : String(e)}` };
 	}
