@@ -419,14 +419,12 @@ const shellSessions = new Map<string, ShellSession>();
 
 function spawnSessionShell(cwd: string): ChildProcess {
   if (process.platform === "win32") {
-    // Read command frames from stdin; NonInteractive avoids host prompts.
     return spawn(
       "powershell.exe",
       ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "-"],
       { cwd, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] },
     );
   }
-  // Non-interactive bash (no -i): interactive mode can hang on job control / PS1.
   return spawn("bash", ["--noprofile", "--norc"], {
     cwd,
     stdio: ["pipe", "pipe", "pipe"],
