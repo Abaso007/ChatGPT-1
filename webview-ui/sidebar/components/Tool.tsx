@@ -225,10 +225,24 @@ function SubagentCard({ block, onOpen, awaitingApproval }: { block: ToolBlock; o
     : running
       ? subagentActivity(block.subBlocks)
       : undefined;
+  // Live progress inline while it works; folds away once the subagent settles.
+  const [open, toggleOpen] = useLiveDisclosure(running);
+  const toolSteps = (block.subBlocks ?? []).filter((b): b is ToolBlock => b.kind === "tool");
+  const recent = toolSteps.slice(-6);
 
   return (
     <div className={"subagent-card" + (awaitingApproval ? " needs-approval" : "")} onClick={() => onOpen?.(block.callId)} role="button" title="Open subagent">
       <div className="subagent-card-main">
+        <span
+          className={"tchev" + (open ? " open" : "")}
+          onClick={(e) => {
+            e.stopPropagation();
+            toggleOpen();
+          }}
+          title={open ? "Collapse steps" : "Expand steps"}
+        >
+          <Icon name="chevD" />
+        </span>
         <span className="ticon"><Icon name="task" /></span>
         <span className="label">{i.description || "Subagent"}</span>
         <span className="sub-spacer" />
@@ -239,6 +253,24 @@ function SubagentCard({ block, onOpen, awaitingApproval }: { block: ToolBlock; o
         <Icon name="chevR" size={14} className="sub-open-chev" />
       </div>
       {subtitle && <div className="subagent-card-subtitle">{subtitle}</div>}
+      {open && (
+        <div className="subagent-steps">
+          {recent.length === 0 ? (
+            <div className="subagent-step muted">{running ? "Starting…" : "No steps"}</div>
+          ) : (
+            recent.map((s) => {
+              const m = toolMeta(s.name, s.input || {});
+              return (
+                <div key={s.callId} className={"subagent-step " + s.status}>
+                  <span className="step-icon"><Icon name={m.icon} size={11} /></span>
+                  <span className="step-label" title={m.label}>{m.label || s.name}</span>
+                  {s.status === "running" ? <span className="spinner" /> : <StatusIcon status={s.status} />}
+                </div>
+              );
+            })
+          )}
+        </div>
+      )}
     </div>
   );
 }
