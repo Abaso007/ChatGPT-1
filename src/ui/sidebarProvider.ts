@@ -1086,6 +1086,17 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     return out;
   }
 
+  /**
+   * Bare model ids the given provider/OAuth account can actually serve. Used to
+   * reject subagent model slugs the agent invented or borrowed from another provider.
+   */
+  private _modelsForProvider(providerId?: string, oauthKind?: oauth.OAuthKind): string[] {
+    const list = this._buildModelList(this._fetchedCache ?? []);
+    const wanted = oauthKind ? `__oauth__:${oauthKind}` : providerId;
+    if (!wanted) return [];
+    return [...new Set(list.filter((m) => m.providerId === wanted).map((m) => m.modelId || stripModelScope(m.id)))];
+  }
+
   /** Auto mode: ask the judge model to choose an enabled model for the task. */
   private async _resolveAutoModel(task: string): Promise<string> {
     const features = this.featureStore.get();
@@ -1555,6 +1566,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         approve: (toolName, input, callId) => this._approveTool(convId, session, toolName, input, callId),
         customSubagents: features.subagents,
         subagentModel: features.subagentModel,
+        availableModels: this._modelsForProvider(prov.providerId, prov.oauthKind),
         registerSubagentAbort: (callId, abort) => {
           // Chain aborts (tool kill + nested Task child) so timeout fires both.
           const prev = session.subagentAborts.get(callId);

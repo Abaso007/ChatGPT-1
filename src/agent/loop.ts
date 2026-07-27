@@ -167,7 +167,7 @@ function coalesceEmit(raw: (e: AgentEvent) => void): (e: AgentEvent) => void {
 }
 
 export async function runAgent(opts: RunAgentOptions): Promise<void> {
-	const { apiBaseUrl, apiKey, model, prompt, attachments, history: persistedHistory, maxTokens, maxSteps, autoContinue, contextTokens, sampling, modelParams, anthropic, oauthKind, systemPromptOverride, extraInstructions, enableFileReading, enableTerminalSuggestions, enableWorkspaceContext, approve, isSubagent, customSubagents, subagentModel, registerSubagentAbort, askUser, onAfterRun, onBeforeShell, onAfterEdit, onHook, signal, emit: rawEmit } = opts;
+	const { apiBaseUrl, apiKey, model, prompt, attachments, history: persistedHistory, maxTokens, maxSteps, autoContinue, contextTokens, sampling, modelParams, anthropic, oauthKind, systemPromptOverride, extraInstructions, enableFileReading, enableTerminalSuggestions, enableWorkspaceContext, approve, isSubagent, customSubagents, subagentModel, availableModels, registerSubagentAbort, askUser, onAfterRun, onBeforeShell, onAfterEdit, onHook, signal, emit: rawEmit } = opts;
 	// Model history is disposable and may be compacted/pruned. Persisted history
 	// remains lossless for chat display/export, including full tool output/thinking.
 	const history: Step[] = persistedHistory.map((s) => structuredClone(s));
@@ -223,7 +223,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			const subReadonly = def ? def.readonly : readonly;
 			const subSystemOverride = def ? def.prompt : systemPromptOverride;
 			// Model precedence: explicit task model → per-subagent override → global subagent model → chat model.
-			const subModel = opts?.model || def?.model || subagentModel || model;
+			// Models the agent invents (or that belong to another provider) would fail
+			// against this run's endpoint, so only honour ids the provider actually offers.
+			const known = (id: string | undefined): string | undefined => {
+				if (!id) return undefined;
+				if (!availableModels?.length) return id;
+				return availableModels.some((m) => m.toLowerCase() === id.toLowerCase()) ? id : undefined;
+			};
+			const subModel = known(opts?.model) || known(def?.model) || known(subagentModel) || model;
 			// Attach any provided files to the subagent prompt as context.
 			if (opts?.fileAttachments?.length) {
 				subPrompt = `${subPrompt}\n\n<attached_files>\n${opts.fileAttachments.join("\n")}\n</attached_files>`;

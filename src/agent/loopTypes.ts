@@ -46,6 +46,8 @@ export interface RunAgentOptions {
 	customSubagents?: SubagentDef[];
 	/** Default model for subagents ("" = inherit this run's model). */
 	subagentModel?: string;
+	/** Model ids selectable for this run's provider; a Task model outside this list is ignored. */
+	availableModels?: string[];
 	/** Called when a subagent starts, so the UI can offer a per-subagent stop. */
 	registerSubagentAbort?: (callId: string, abort: () => void) => void;
 	/** Ask the user clarifying questions via the chat UI (ask_question tool). */
