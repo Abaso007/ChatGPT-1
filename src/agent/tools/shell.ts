@@ -16,16 +16,12 @@ import {
   renderShell,
   pushShellOutput,
   getShellSession,
-  disposeShellSession,
-  detachShellSession,
-  nextShellMarker,
-  markerRe,
-  buildSessionScript,
-  submitToSession,
+  spawnShellCommand,
+  killShellProcess,
+  applyCwdSideEffect,
   type BgShell,
   type ShellNotify,
 } from "./shared";
-const isWin = process.platform === "win32";
 /** Default foreground wait for simple commands; hard max keeps the loop responsive. */
 const DEFAULT_BLOCK_MS = 30_000;
 
@@ -90,42 +86,43 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
   }
 
   const sessionKey = (ctx as any)?.shellSessionKey ?? "default";
-  let session = getShellSession(sessionKey, root);
+  const session = getShellSession(sessionKey, root);
 
-  // Serialize commands on this session.
+  // Serialize foreground commands per run so their output can't interleave.
   // Always settle the queue slot even if this command errors/times out.
   let releaseQueue!: () => void;
   const prev = session.queue.catch(() => {});
   session.queue = new Promise<void>((r) => {
     releaseQueue = r;
   });
-  try {
-    let queueTimedOut = false;
-    await Promise.race([
-      prev,
-      new Promise<void>((resolve) => setTimeout(() => {
-        queueTimedOut = true;
-        resolve();
-      }, MAX_BLOCK_MS + 5_000)),
-    ]);
-    if (queueTimedOut) disposeShellSession(sessionKey);
-  } catch {
-    disposeShellSession(sessionKey);
+  await Promise.race([
+    prev,
+    new Promise<void>((resolve) => {
+      setTimeout(resolve, MAX_BLOCK_MS + 5_000).unref?.();
+    }),
+  ]);
+
+  let cwd = session.cwd || root;
+  if (input.working_directory) {
+    try {
+      cwd = safePath(String(input.working_directory));
+    } catch (e) {
+      releaseQueue();
+      return {
+        output: `error: invalid working_directory: ${e instanceof Error ? e.message : String(e)}`,
+      };
+    }
   }
-  // Never submit into a session whose prior command still owns the protocol.
-  session = getShellSession(sessionKey, root);
 
   const sh: BgShell = {
     id: nextShellId(),
     command,
-    proc: session.proc,
     output: "",
     done: false,
     exitCode: null,
     startedAt: Date.now(),
     status: "running",
-    cwd: session.cwd,
-    marker: nextShellMarker(),
+    cwd,
     notify: buildNotify(input, ctx),
   };
   bgShells.set(sh.id, sh);
@@ -143,130 +140,75 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
     live?.();
   };
 
-  const killSession = () => {
-    try {
-      disposeShellSession(sessionKey, session);
-      if (isWin) session.proc.kill();
-      else session.proc.kill("SIGKILL");
-    } catch {
-      /* ignore */
-    }
-  };
+  // Spawn the command verbatim in its own shell: it owns its exit code and the
+  // shell dies with it, so there is nothing left to wait on once it finishes.
+  let proc: ReturnType<typeof spawnShellCommand>;
+  try {
+    proc = spawnShellCommand(command, cwd);
+  } catch (e) {
+    releaseQueue();
+    settle("failed", 1);
+    return { output: `error: failed to start shell: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  sh.proc = proc;
+  session.running.add(proc);
+
+  const kill = () => killShellProcess(proc);
   const onAbort = () => {
     settle("aborted", sh.exitCode ?? 130, "(aborted)");
-    killSession();
+    kill();
   };
   abortSignal?.addEventListener("abort", onAbort);
 
-  let cd = "";
-  if (input.working_directory) {
-    try {
-      cd = safePath(String(input.working_directory));
-    } catch (e) {
-      abortSignal?.removeEventListener("abort", onAbort);
-      settle("failed", 1);
-      releaseQueue();
-      return {
-        output: `error: invalid working_directory: ${e instanceof Error ? e.message : String(e)}`,
-      };
-    }
-  }
-  // A per-call cwd applies only to this command; the session keeps its own cwd.
-  if (cd) {
-    sh.cwd = cd;
-  }
-
-  const doneRe = markerRe(sh.marker!);
-  let lastSeen = session.buffer.length;
-  sh.pump = () => {
-    try {
-      if (session.buffer.length > lastSeen) {
-        pushShellOutput(sh, session.buffer.slice(lastSeen));
-        lastSeen = session.buffer.length;
-      }
-      if (!sh.done) {
-        // Completion marker written by the session protocol carries the exit code.
-        const m = doneRe.exec(sh.output);
-        if (m) {
-          const code = Number(m[1]);
-          settle(code === 0 ? "completed" : "failed", Number.isFinite(code) ? code : 1);
-          return;
-        }
-        if (session.closed || session.proc.killed || session.proc.exitCode != null) {
-          const code = session.proc.exitCode ?? 1;
-          settle(
-            code === 0 ? "completed" : "failed",
-            code,
-            session.error ? `(shell session failed: ${session.error})` : undefined,
-          );
-        }
-      }
-    } catch (e) {
-      settle("failed", 1, `(pump error: ${e instanceof Error ? e.message : String(e)})`);
-    }
+  const onData = (d: Buffer | string) => {
+    try { pushShellOutput(sh, d.toString()); } catch { /* ignore */ }
   };
-
-  const script = buildSessionScript(command, sh.marker!, cd || undefined);
-  try {
-    await submitToSession(session, script);
-  } catch (e) {
-    abortSignal?.removeEventListener("abort", onAbort);
-    settle("failed", 1);
-    killSession();
-    releaseQueue();
-    return {
-      output: `error: shell write failed: ${e instanceof Error ? e.message : String(e)}`,
-    };
-  }
-  // Foreground wait expiry returns a background handle; the outer tool budget
-  // remains longer so this transition and cleanup cannot race the hard timeout.
+  proc.stdout?.on("data", onData);
+  proc.stderr?.on("data", onData);
+  proc.on("error", (error) => {
+    settle("failed", sh.exitCode ?? 1, `(failed to run command: ${error.message})`);
+  });
+  // 'close' (not 'exit') so all stdio has been flushed before we settle.
+  proc.on("close", (code, signal) => {
+    session.running.delete(proc);
+    if (signal) sh.signal = String(signal);
+    const exit = code ?? (signal ? 143 : 0);
+    if (sh.status === "aborted" || sh.done) {
+      sh.exitCode = sh.exitCode ?? exit;
+      return;
+    }
+    settle(exit === 0 ? "completed" : "failed", exit);
+  });
+  // Output is pushed by the stream listeners; pump only refreshes timing.
+  sh.pump = () => { /* event-driven; nothing to pull */ };
 
   const waitMs = blockMs <= 0 ? 0 : Math.min(blockMs, SHELL_HARD_WALL_MS);
   try {
     await waitForShell(sh, waitMs, undefined, abortSignal);
-    try {
-      sh.pump?.();
-    } catch {
-      /* ignore */
-    }
 
-    // Abort/timeout: kill session immediately so the loop is free.
     if (abortSignal?.aborted && !sh.done) {
       settle("aborted", sh.exitCode ?? 130, "(aborted / timed out)");
-      killSession();
+      kill();
     } else if (!sh.done) {
+      // Foreground expiry is not a failure: the command keeps running and stays
+      // observable through AwaitShell (dev servers, watchers, long builds).
       sh.status = "backgrounded";
-      // Foreground expiry is not command failure. Keep capturing delayed stderr
-      // (including endpoint-security diagnostics) and let AwaitShell observe it.
-      detachShellSession(sessionKey, session);
-      const bgPump = setInterval(() => {
-        try {
-          sh.pump?.();
-        } catch {
-          /* ignore */
-        }
-        if (sh.done) clearInterval(bgPump);
-      }, 100);
-      // A genuinely stuck command remains observable without poisoning the
-      // queue forever. Reset only after the background lifetime expires.
+      live?.();
       setTimeout(() => {
         if (!sh.done) {
-          settle("timeout", sh.exitCode ?? 124, "(background limit reached after 10m — shell session reset)");
-          try {
-            if (isWin) session.proc.kill();
-            else session.proc.kill("SIGKILL");
-          } catch {
-            /* ignore */
-          }
+          settle("timeout", sh.exitCode ?? 124, "(background limit reached after 10m — command killed)");
+          kill();
         }
-        clearInterval(bgPump);
       }, 600_000).unref?.();
+    } else if (sh.status === "completed") {
+      // Only a clean `cd` moves the run's working directory.
+      applyCwdSideEffect(session, command);
     }
 
     return { output: renderShell(sh) };
   } catch (e) {
     settle("failed", 1, `(error: ${e instanceof Error ? e.message : String(e)})`);
-    killSession();
+    kill();
     return { output: renderShell(sh) };
   } finally {
     abortSignal?.removeEventListener("abort", onAbort);

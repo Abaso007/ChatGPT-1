@@ -374,7 +374,8 @@ export type ShellStatus = "running" | "completed" | "failed" | "aborted" | "time
 export interface BgShell {
   id: string;
   command: string;
-  proc: ChildProcess;
+  /** The child shell running this command (unset until spawned). */
+  proc?: ChildProcess;
   output: string;
   done: boolean;
   exitCode: number | null;
@@ -386,8 +387,6 @@ export interface BgShell {
   status: ShellStatus;
   /** Signal that killed the underlying process, when known. */
   signal?: string;
-  /** Completion marker written by the session protocol for this command. */
-  marker?: string;
   notify?: ShellNotify;
   /** Pull any new session output into this shell's buffer (for polling). */
   pump?: () => void;
@@ -421,165 +420,95 @@ export function pushShellOutput(sh: BgShell, chunk: string): void {
 // Persistent stateful shell sessions (cwd/env persist across commands per run)
 // ---------------------------------------------------------------------------
 
+/**
+ * A run's shell state. Each command runs in its own child shell (so it always
+ * exits with a real exit code and never leaves the agent waiting on a live
+ * REPL); only the working directory is carried across calls.
+ */
 export interface ShellSession {
-  proc: ChildProcess;
-  /** Serializes command execution so output framing stays intact. */
-  queue: Promise<unknown>;
-  buffer: string;
-  closed: boolean;
-  error?: string;
-  /** Directory the session shell was started in. */
+  /** Directory the next command runs in (updated by `cd`). */
   cwd: string;
+  /** Serializes command execution within a run. */
+  queue: Promise<unknown>;
+  /** Commands still running for this run (killed on dispose). */
+  running: Set<ChildProcess>;
 }
 
 const IS_WIN = process.platform === "win32";
-let markerSeq = 0;
-
-/** Unique completion marker for one command submitted to a session shell. */
-export function nextShellMarker(): string {
-  return `__OC_SHELL_DONE___m${++markerSeq}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-/** Matches "<marker>:<exit code>" anywhere in the stream. */
-export function markerRe(marker: string): RegExp {
-  return new RegExp(`${marker}:(-?\\d+)`);
-}
-
-/**
- * Wrap a user command so the session shell reports its exit status back on a
- * marker line. The session stays alive (stdin is never closed), so cwd, env and
- * shell variables persist across calls in the same run.
- */
-export function buildSessionScript(command: string, marker: string, cwd?: string): string {
-  if (IS_WIN) {
-    return [
-      "$global:LASTEXITCODE = $null",
-      "$ErrorActionPreference = 'Continue'",
-      // A per-call working directory must not leak into the persistent session.
-      cwd ? `Push-Location -LiteralPath ${psQuote(cwd)}` : "",
-      command,
-      "$__oc = if ($LASTEXITCODE -ne $null) { $LASTEXITCODE } elseif ($?) { 0 } else { 1 }",
-      cwd ? "Pop-Location" : "",
-      `Write-Output ("\`n${marker}:" + $__oc)`,
-      "",
-    ]
-      .filter((l) => l !== "")
-      .join("\n");
-  }
-  return [
-    cwd ? `pushd ${shQuote(cwd)} >/dev/null` : "",
-    command,
-    "__oc_status=$?",
-    cwd ? "popd >/dev/null" : "",
-    `printf '\\n${marker}:%s\\n' "$__oc_status"`,
-    "",
-  ]
-    .filter((l) => l !== "")
-    .join("\n");
-}
-
-/** Single-quote a PowerShell literal. */
-function psQuote(s: string): string {
-  return `'${s.replace(/'/g, "''")}'`;
-}
-
-/** Single-quote a POSIX shell literal. */
-function shQuote(s: string): string {
-  return `'${s.replace(/'/g, `'\\''`)}'`;
-}
-
-/** Write a command into a live session shell without closing its stdin. */
-export function submitToSession(session: ShellSession, script: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const stdin = session.proc.stdin;
-    if (!stdin || stdin.destroyed || !stdin.writable) {
-      reject(new Error("shell stdin is not writable"));
-      return;
-    }
-    let settled = false;
-    const finish = (error?: Error | null) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      stdin.removeListener("error", onError);
-      error ? reject(error) : resolve();
-    };
-    const onError = (error: Error) => finish(error);
-    const timer = setTimeout(() => finish(new Error("shell write did not complete within 5s")), 5_000);
-    stdin.once("error", onError);
-    stdin.write(script, (err) => finish(err));
-  });
-}
-
 const shellSessions = new Map<string, ShellSession>();
 
-function spawnSessionShell(cwd: string): ChildProcess {
-  if (process.platform === "win32") {
-    return spawn(
-      "powershell.exe",
-      ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "-"],
-      { cwd, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] },
-    );
-  }
-  return spawn("bash", ["--noprofile", "--norc"], {
-    cwd,
-    stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, TERM: "dumb", PS1: "", PS2: "" },
-  });
-}
-
-/** Get (or lazily create) the persistent shell session for a run key. */
+/** Get (or lazily create) the shell state for a run key. */
 export function getShellSession(key: string, cwd: string): ShellSession {
   let s = shellSessions.get(key);
-  if (s && !s.closed && !s.proc.killed && s.proc.exitCode === null && s.proc.stdin && !s.proc.stdin.destroyed && s.proc.stdin.writable) {
-    return s;
+  if (!s) {
+    s = { cwd, queue: Promise.resolve(), running: new Set() };
+    shellSessions.set(key, s);
   }
-  if (s) {
-    try { s.proc.kill(); } catch { /* ignore */ }
-    shellSessions.delete(key);
-  }
-  const proc = spawnSessionShell(cwd);
-  s = { proc, queue: Promise.resolve(), buffer: "", closed: false, cwd };
-  proc.stdout?.on("data", (d) => {
-    try { s!.buffer += d.toString(); } catch { /* ignore */ }
-  });
-  proc.stderr?.on("data", (d) => {
-    try { s!.buffer += d.toString(); } catch { /* ignore */ }
-  });
-  proc.on("error", (error) => {
-    s!.error = error.message;
-    s!.closed = true;
-    s!.buffer += `\n(shell process error: ${error.message})`;
-  });
-  proc.on("exit", (code, signal) => {
-    s!.closed = true;
-    if (code !== 0 || signal) {
-      s!.buffer += `\n(shell process exited${code == null ? "" : ` with code ${code}`}${signal ? ` from signal ${signal}` : ""})`;
-    }
-  });
-  proc.on("close", () => {
-    s!.closed = true;
-  });
-  // Prevent unhandled 'error' on stdin from crashing the extension host.
-  proc.stdin?.on("error", () => { /* ignore broken pipe */ });
-  shellSessions.set(key, s);
   return s;
 }
 
-/** Tear down a run's persistent shell session (call on run end / dispose). */
-export function disposeShellSession(key: string, expected?: ShellSession): void {
-  const s = shellSessions.get(key);
-  if (!s || (expected && s !== expected)) return;
+/**
+ * Spawn one command in its own shell. The command is passed through verbatim —
+ * no wrapper script, no marker protocol — so its own exit code is the process
+ * exit code and the shell terminates the moment the command does.
+ */
+export function spawnShellCommand(command: string, cwd: string): ChildProcess {
+  const proc = IS_WIN
+    ? spawn(
+        "powershell.exe",
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+        { cwd, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] },
+      )
+    : spawn("bash", ["--noprofile", "--norc", "-c", command], {
+        cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, TERM: "dumb", PS1: "", PS2: "" },
+      });
+  // Nothing will ever type at this shell: close stdin so anything that prompts
+  // reads EOF and exits instead of hanging forever.
   try {
-    if (process.platform === "win32") s.proc.kill();
-    else s.proc.kill("SIGKILL");
+    proc.stdin?.on("error", () => { /* ignore broken pipe */ });
+    proc.stdin?.end();
   } catch { /* ignore */ }
-  shellSessions.delete(key);
+  return proc;
 }
 
-/** Detach a busy session so later commands get a fresh shell while it finishes. */
-export function detachShellSession(key: string, session: ShellSession): void {
-  if (shellSessions.get(key) === session) shellSessions.delete(key);
+/** Kill a command and everything it spawned (npm/pnpm scripts spawn children). */
+export function killShellProcess(proc: ChildProcess): void {
+  if (!proc || proc.exitCode != null || proc.signalCode) return;
+  try {
+    if (IS_WIN && proc.pid) {
+      const killer = spawn("taskkill", ["/pid", String(proc.pid), "/T", "/F"], { windowsHide: true });
+      killer.on("error", () => { try { proc.kill(); } catch { /* ignore */ } });
+    } else if (proc.pid) {
+      // Negative pid targets the process group when detached; fall back to the pid.
+      try { process.kill(-proc.pid, "SIGKILL"); } catch { proc.kill("SIGKILL"); }
+    } else {
+      proc.kill();
+    }
+  } catch { /* ignore */ }
+}
+
+/**
+ * Carry `cd` across calls without keeping a live shell: a command that is only
+ * a directory change updates the session cwd for subsequent commands.
+ */
+export function applyCwdSideEffect(session: ShellSession, command: string): void {
+  const m = /^\s*cd\s+(?:\/d\s+)?("([^"]+)"|'([^']+)'|[^\s&|;]+)\s*$/i.exec(command);
+  if (!m) return;
+  const target = (m[2] ?? m[3] ?? m[1]).trim();
+  if (!target || target === "-") return;
+  const next = path.isAbsolute(target) ? target : path.resolve(session.cwd, target);
+  session.cwd = next;
+}
+
+/** Tear down a run's shell state, killing anything still running. */
+export function disposeShellSession(key: string): void {
+  const s = shellSessions.get(key);
+  if (!s) return;
+  for (const proc of s.running) killShellProcess(proc);
+  s.running.clear();
+  shellSessions.delete(key);
 }
 
 /**
@@ -651,11 +580,6 @@ function collapseRepeats(s: string): string {
   return out.join("\n");
 }
 
-/** Strip the session completion protocol out of user-visible output. */
-export function stripShellProtocol(s: string): string {
-  return s.replace(/^.*__OC_SHELL_DONE__\w+:-?\d+.*$\r?\n?/gm, "");
-}
-
 /** Human-readable label for a settled shell status. */
 function statusLabel(sh: BgShell): string {
   switch (sh.status) {
@@ -679,7 +603,7 @@ export function renderShell(sh: BgShell): string {
   // Trim trailing blank lines the shell echoes; collapse >2 blank lines and
   // runs of identical lines (progress spinners, repeated warnings).
   const cleaned = collapseRepeats(
-    stripShellProtocol(sh.output).replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trimEnd(),
+    sh.output.replace(/\r(?!\n)/g, "\n").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trimEnd(),
   );
   const body = clampMiddle(cleaned, 12000);
   if (sh.done) {
