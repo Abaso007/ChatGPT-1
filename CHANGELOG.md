@@ -4,6 +4,42 @@ All notable changes to the "ocursor" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.1.0] - 2026-07-27
+
+### Added
+
+- Live terminal output: Shell/AwaitShell stream stdout+stderr into the tool card as it is produced, with auto-scroll and a blinking caret (new `tool-call-progress` event)
+- Shell result footer reports the real exit code and outcome (`exit_code=0 success in 1.2s`, failed / aborted / timed out / backgrounded); the card colors itself green or red from it
+- Working directory persists across Shell calls in a run — a bare `cd <dir>` moves it, `working_directory` still applies to a single call
+- Cards follow the work: thinking, plan, terminal, generic tool, subagent, and grouped explore cards expand while running and collapse when they settle (a manual toggle wins until the state changes)
+- Subagent cards show a status badge, the resolved model name and step count as separate chips, a compact list of the two most recent steps, and a live activity line ("Planning next move…")
+- Running spinners double as kill switches: hovering any in-flight tool, terminal, or subagent spinner turns it into a stop button that force-terminates that task
+- `ListDir` output opens with a one-line legend (`trailing / = directory`) so directories are never mistaken for files
+- Centralized `OpenCursor` output channel with structured `logError` reporting, replacing silently swallowed startup/index/tool failures
+- Portable `/workspace` path alias accepted from the model on every host OS
+
+### Fixed
+
+- Commands no longer hang after finishing: each command runs in its own child shell and settles on process close, instead of waiting on a persistent REPL that never reported completion
+- Killing a command kills its children too (`taskkill /T /F` on Windows, process-group SIGKILL elsewhere), so `pnpm`/`npm` scripts leave no orphans holding the pipe open
+- Commands that prompt for input get EOF immediately instead of blocking forever
+- Denied shell commands can no longer be smuggled through chaining: `git add -A; git commit …` is checked per command (`;`, `&&`, `||`, `|`, newlines, sub-shells), and the denial names the command that actually tripped the rule
+- Todos are per-run context instead of a module global, so concurrent chats no longer clobber each other's task lists
+- Outside-workspace detection covers every path-bearing tool input (ListDir, Glob, Grep, SemanticSearch, Shell `working_directory`, …) and resolves paths properly on Windows
+- `dir/**` allow rules also match the directory itself, so listing an approved folder no longer re-prompts
+- Antigravity and Codex OAuth transports updated (host-correct platform metadata, request ids, model list, Codex `client_version` and prompt cache key); Claude Code sends the CLI beta set
+- Gemini tool results are sent with the tool's name instead of its call id
+
+### Changed
+
+- Denied approvals report the blocked subject back to the model so it can pick another approach
+- Inline diff review consolidated onto a single diff-view path (virtual original-content provider removed) with more reliable editor refresh
+- Antigravity max output tokens raised to 64k
+- Subagent tabs render as plain chats — the "Back to chat" header, read-only tag, and Stop button were removed
+- Subagent cards expand and collapse with the run itself; the manual chevron toggle is gone
+- Quieter chat surface: hover shadows, lift/scale animations, and accent left borders removed from tool cards, message bubbles, approval and error cards, and composer buttons
+- Collapsed terminal cards align their prompt, command, and badges on a single vertical center line
+
 ## [0.0.9] - 2026-07-25
 
 ### Added
