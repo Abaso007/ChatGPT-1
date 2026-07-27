@@ -12,7 +12,7 @@ import { Icon } from "../shared/icons";
 import { renderMarkdown } from "../shared/markdown";
 import { vscode } from "../shared/vscode";
 import { Composer, KIND_SVG, applyFileIconTo } from "./components/Composer";
-import { ToolCard, isReadonlySubagent, TimeoutBadge, ToolTimeoutWatch, isToolCountdownActive } from "./components/Tool";
+import { ToolCard, isReadonlySubagent, TimeoutBadge, ToolTimeoutWatch, isToolCountdownActive, useLiveDisclosure } from "./components/Tool";
 import { History } from "./components/History";
 import type { AgentEvent, ApprovalMode, ApprovalRequestInfo, AssistantBlock, AssistantTurn, Attachment, ConversationSummary, ErrorBlock, InMessage, MentionItem, Mode, ModelDef, ModelOption, OutMessage, PendingChangeInfo, PersonaInfo, ThinkingBlock, ToolBlock, Turn, UserTurn } from "./types";
 import { applyEvent, applyToBlocks, closeTrailingThinking, forceSettleOpenWork, parsePartialArgs, renderMentionTokens } from "./types";
@@ -363,13 +363,13 @@ function CompactionCard({ block }: { block: import("./types").AssistantBlock & {
 }
 
 function ThinkingCard({ block }: { block: ThinkingBlock }) {
-  const [open, setOpen] = React.useState(false);
   const live = !block.endedAt;
+  const [open, toggleOpen] = useLiveDisclosure(live);
   const secs = block.endedAt && block.startedAt ? Math.max(1, Math.round((block.endedAt - block.startedAt) / 1000)) : 0;
   const title = live ? "Thinking" : secs ? `Thought for ${secs}s` : "Thought";
   return (
     <div className={"thinking-card" + (open ? " open" : "") + (live ? " live" : "")}>
-      <div className="thinking-head" onClick={() => setOpen((o) => !o)}>
+      <div className="thinking-head" onClick={toggleOpen}>
         <Icon name="brain" size={12} className="thinking-spark" />
         <span className="thinking-title">{title}</span>
         <Icon name={open ? "chevD" : "chevR"} size={12} className="thinking-chev" />

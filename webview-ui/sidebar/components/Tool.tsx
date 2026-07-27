@@ -283,12 +283,12 @@ function PlanCard({ block, onImplement }: { block: ToolBlock; onImplement?: (pat
   const content: string = i.content || "";
   // The write_plan result is "wrote plan to .plans/<file>.md".
   const planPath = (block.result || "").replace(/^wrote plan to\s+/, "").trim() || undefined;
-  const [open, setOpen] = React.useState(true);
+  const [open, toggleOpen] = useLiveDisclosure(block.status === "running");
   const done = block.status === "completed";
 
   return (
     <div className="plan-card">
-      <div className="plan-header" onClick={() => setOpen((o) => !o)}>
+      <div className="plan-header" onClick={toggleOpen}>
         <span className={"tchev" + (open ? " open" : "")}>
           <Icon name="chevD" />
         </span>
@@ -323,6 +323,28 @@ function PlanCard({ block, onImplement }: { block: ToolBlock; onImplement?: (pat
       )}
     </div>
   );
+}
+
+/**
+ * Disclosure that follows the work: expanded while the block is live, collapsed
+ * once it settles. A manual toggle wins until the block's live state changes
+ * again, so the user is never fighting the automatic behaviour.
+ */
+export function useLiveDisclosure(live: boolean): [boolean, () => void] {
+  const [open, setOpen] = React.useState(live);
+  const manual = React.useRef(false);
+  const prevLive = React.useRef(live);
+  React.useEffect(() => {
+    if (prevLive.current === live) return;
+    prevLive.current = live;
+    manual.current = false;
+    setOpen(live);
+  }, [live]);
+  const toggle = React.useCallback(() => {
+    manual.current = true;
+    setOpen((o) => !o);
+  }, []);
+  return [open, toggle];
 }
 
 function StatusIcon({ status }: { status: ToolBlock["status"] }) {
@@ -618,17 +640,22 @@ function ToolCardInner({ block, onImplement, onOpenSubagent, awaitingApproval }:
   const meta = toolMeta(block.name, i);
   const isEdit = block.name === "edit_file" || block.name === "StrReplace" || block.name === "Write";
   const isShell = block.name === "run_terminal" || block.name === "Shell" || block.name === "AwaitShell";
-  const [open, setOpen] = React.useState(isEdit || isShell);
+  // Expanded while the tool works, collapsed the moment it settles.
+  const [open, toggleOpen] = useLiveDisclosure(block.status === "running");
 
   const onHeaderClick = () => {
     if (isEdit) {
       post({ type: "openFile", path: i.path || "", startLine: block.startLine });
     } else {
-      setOpen((o) => !o);
+      toggleOpen();
     }
   };
+  const onChevClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    toggleOpen();
+  };
 
-  const showBody = isEdit ? true : open;
+  const showBody = open;
   const shellCmd = isShell ? String(i.command || meta.label || "") : "";
   const shellParsed = isShell ? parseShellResult(block.result, shellCmd) : null;
 
@@ -636,11 +663,10 @@ function ToolCardInner({ block, onImplement, onOpenSubagent, awaitingApproval }:
     <div className={"tool-card " + (isEdit ? "edit-card" : "compact-card") + (isShell ? " shell-card" : "")}>
       <div className={"tool-card-header " + (isEdit ? "edit-header" : "compact") + (isShell ? " shell-header" : "")} onClick={onHeaderClick}>
         <div className="left">
-          {!isEdit && (
-            <span className={"tchev" + (open ? " open" : "")}>
-              <Icon name="chevD" />
-            </span>
-          )}
+          {/* Edit headers open the file, so the chevron owns the disclosure. */}
+          <span className={"tchev" + (open ? " open" : "")} onClick={isEdit ? onChevClick : undefined}>
+            <Icon name="chevD" />
+          </span>
           <span className="ticon">
             {isEdit ? <FileIcon path={i.path || ""} fallback={meta.icon} /> : <Icon name={meta.icon} />}
           </span>

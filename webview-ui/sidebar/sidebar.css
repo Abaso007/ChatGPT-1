@@ -522,6 +522,8 @@ body {
 .shell-footer.ok { color: var(--green, #3c9); }
 .shell-footer.err { color: var(--error, #e55); }
 .shell-footer { display: flex; align-items: center; gap: 5px; }
+/* Edit headers open the file on click, so the chevron is its own hit target. */
+.edit-header .tchev { cursor: pointer; }
 .shell-footer svg { width: 11px; height: 11px; flex: 0 0 auto; }
 /* Live output: blinking caret at the tail of the stream. */
 .term-caret {
