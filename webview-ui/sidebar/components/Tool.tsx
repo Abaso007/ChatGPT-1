@@ -693,12 +693,8 @@ function ToolCardInner({ block, onImplement, onOpenSubagent, awaitingApproval }:
       toggleOpen();
     }
   };
-  const onChevClick = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    toggleOpen();
-  };
-
-  const showBody = open;
+  // Edit cards always show their body — the diff has its own expander.
+  const showBody = isEdit || open;
   const shellCmd = isShell ? String(i.command || meta.label || "") : "";
   const shellParsed = isShell ? parseShellResult(block.result, shellCmd) : null;
 
@@ -706,10 +702,11 @@ function ToolCardInner({ block, onImplement, onOpenSubagent, awaitingApproval }:
     <div className={"tool-card " + (isEdit ? "edit-card" : "compact-card") + (isShell ? " shell-card" : "")}>
       <div className={"tool-card-header " + (isEdit ? "edit-header" : "compact") + (isShell ? " shell-header" : "")} onClick={onHeaderClick}>
         <div className="left">
-          {/* Edit headers open the file, so the chevron owns the disclosure. */}
-          <span className={"tchev" + (open ? " open" : "")} onClick={isEdit ? onChevClick : undefined}>
-            <Icon name="chevD" />
-          </span>
+          {!isEdit && (
+            <span className={"tchev" + (open ? " open" : "")}>
+              <Icon name="chevD" />
+            </span>
+          )}
           <span className="ticon">
             {isEdit ? <FileIcon path={i.path || ""} fallback={meta.icon} /> : <Icon name={meta.icon} />}
           </span>
