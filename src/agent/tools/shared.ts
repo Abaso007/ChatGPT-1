@@ -574,27 +574,6 @@ export function renderShell(sh: BgShell): string {
 }
 
 // ---------------------------------------------------------------------------
-// In-memory per-run todo list (TodoWrite / TodoRead)
-// ---------------------------------------------------------------------------
-
-export interface TodoItem {
-  id: string;
-  content: string;
-  status: "pending" | "in_progress" | "completed" | "cancelled";
-}
-
-let TODO_LIST: TodoItem[] = [];
-export function resetTodos(): void {
-  TODO_LIST = [];
-}
-export function getTodos(): TodoItem[] {
-  return TODO_LIST;
-}
-export function setTodos(list: TodoItem[]): void {
-  TODO_LIST = list;
-}
-
-// ---------------------------------------------------------------------------
 // Injected runners (set by the agent loop to avoid circular imports)
 // ---------------------------------------------------------------------------
 

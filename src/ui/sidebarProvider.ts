@@ -915,13 +915,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const sep = modelId.indexOf("::");
     const scopedProvider = sep >= 0 ? modelId.slice(0, sep) : undefined;
     modelId = stripModelScope(modelId);
-
     // OAuth account model: route by the exact scoped account kind when present,
     // else fall back to the model→kind map (legacy / bare ids).
-    const oauthKind = (scopedProvider && (["claude-code", "codex", "antigravity"] as string[]).includes(scopedProvider)
-      ? (scopedProvider as oauth.OAuthKind)
-      : undefined) ?? this._oauthModelKind.get(modelId);
+    const oauthKind = (scopedProvider?.startsWith("__oauth__:")
+      ? (scopedProvider.slice("__oauth__:".length) as oauth.OAuthKind)
+      : scopedProvider && (["claude-code", "codex", "antigravity"] as string[]).includes(scopedProvider)
+        ? (scopedProvider as oauth.OAuthKind)
+        : undefined) ?? this._oauthModelKind.get(modelId);
     if (oauthKind) {
+
       return { baseUrl: "", apiKey: "", model: modelId, anthropic: false, providerId: oauthKind, oauthKind };
     }
     // Local llama.cpp model: served by the extension's own server, no provider
@@ -1006,6 +1008,21 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       out.push({ ...m, id: `${prov.id}::${m.id}`, modelId: m.id, options: this.featureStore.optionsFor(m.id, prov.kind), group: "default", providerId: prov.id, providerName: prov.name });
       seen.add(`${prov.id}::${m.id}`);
     }
+    // Connected OAuth providers also expose enabled catalog/custom models even
+    // when their live model endpoint omits those IDs.
+    for (const { providerId } of fetched) {
+      if (!providerId.startsWith("__oauth__:")) continue;
+      const kind = providerId.slice("__oauth__:".length) as oauth.OAuthKind;
+      const label = oauth.OAUTH_LABEL[kind];
+      const base = kind === "claude-code" ? "anthropic" : kind === "codex" ? "openai" : "google";
+      for (const m of this.featureStore.allModels()) {
+        if (m.providerId !== `oauth:${kind}` && !kindMatches(m.kind, kind)) continue;
+        const pid = `${providerId}::${m.id}`;
+        if (seen.has(pid) || disabledSet.has(m.id) || (!enabledSet.has(m.id) && !catalogIds.has(m.id))) continue;
+        out.push({ ...m, id: pid, modelId: m.id, options: this.featureStore.optionsFor(m.id, kind), group: "other", providerId, providerName: label, kind: base as ModelDef["kind"] });
+        seen.add(pid);
+      }
+    }
     // Fetched curated models per provider. Ollama models are surfaced as local
     // models in their own group (shown unless disabled), not the allowlist.
     for (const { providerId, ids } of fetched) {
@@ -1017,8 +1034,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         for (const id of ids) {
           const pid = `${providerId}::${id}`;
           if (seen.has(pid)) continue;
-          // Account models are gated by the catalog allow-list too: only curated
-          // models are on by default, the rest stay disabled until enabled.
+          // Account models are disabled by default unless explicitly enabled,
+          // except for curated catalog entries that are default-on.
           if (disabledSet.has(id) || (!enabledSet.has(id) && !catalogIds.has(id))) continue;
           // Kind-scoped lookup: prefer a def declared for this OAuth kind, then
           // the base API kind — so the same id can have per-provider names/options.

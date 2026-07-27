@@ -9,7 +9,7 @@
 
 import { streamChat, SamplingParams, ModelParams } from "./provider";
 import type { OAuthKind } from "./oauth";
-import { TOOLS, schemasForMode, toolsForMode, resetTodos, getTodos, disposeShellSession, EDIT_TOOLS, MULTITASK_TOOLS, toolTimeoutMs, withToolTimeout, type AskQuestionItem, type ToolContext } from "./tools";
+import { TOOLS, schemasForMode, toolsForMode, disposeShellSession, EDIT_TOOLS, MULTITASK_TOOLS, toolTimeoutMs, withToolTimeout, type AskQuestionItem, type ToolContext } from "./tools";
 import { actionTypeForCall } from "./approvalPolicy";
 import { getWorkspaceRoot, normalizeToolPaths } from "../context/workspaceUtils";
 import { systemPrompt } from "./prompt";
@@ -189,6 +189,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	// Per-run tool context (avoids module globals so chats run concurrently).
 	const shellSessionKey = `run_${started}_${Math.random().toString(36).slice(2, 8)}`;
 	const toolCtx: ToolContext = {
+		todos: [],
 		askUser,
 		shellSessionKey,
 		getMode: () => mode,
@@ -204,7 +205,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		return `Switched from ${prev} mode to ${next} mode.`;
 	};
 	if (!isSubagent) {
-		resetTodos();
 		// Subagent runner for the `task` tool (top-level runs only).
 		toolCtx.runSubagent = async (subPrompt, readonly, subagentName, subSignal, callId, opts) => {
 			// resume/interrupt aren't representable in this single-shot runtime.
@@ -694,7 +694,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				}
 				// Unfinished todo list → one nudge to finish or explicitly wrap up.
 				if (isAgentic() && !isSubagent && !todoNudged) {
-					const open = getTodos().filter((t) => t.status === "pending" || t.status === "in_progress");
+					const open = toolCtx.todos.filter((t) => t.status === "pending" || t.status === "in_progress");
 					if (open.length) {
 						todoNudged = true;
 						pushHistory({
@@ -715,7 +715,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				let input: any = {};
 				let badArgs = false;
 				try {
-					input = JSON.parse(call.arguments || "{}");
+					input = normalizeToolPaths(call.name, JSON.parse(call.arguments || "{}"), getWorkspaceRoot());
 				} catch {
 					// Truncated/invalid args JSON (common on very large edits). Executing
 					// with {} would call tools with missing params — fail the call instead.
@@ -771,8 +771,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			};
 
 			const exec = async (i: number) => {
-				const { call, badArgs } = parsed[i];
-				const input = normalizeToolPaths(call.name, parsed[i].input, getWorkspaceRoot());
+				const { call, input, badArgs } = parsed[i];
 				if (badArgs) {
 					results[i] = {
 						status: "error",
