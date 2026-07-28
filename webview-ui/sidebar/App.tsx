@@ -465,13 +465,18 @@ function SubagentChat({
   const running = !subDone && (block.status === "running" || !!block.subStatus || (block.subBlocks?.length ?? 0) > 0);
   const sub = block.subBlocks ?? [];
   const taskPrompt = String(block.input?.prompt || "").trim();
+  const subType = String(block.input?.subagent_type || "").trim();
+  const subName = subType && subType !== "generalPurpose" ? subType : "";
   const [promptOpen, setPromptOpen] = React.useState(false);
   const pinnedApprovals = React.useMemo(() => approvalsForSubagent(block, approvals), [block, approvals]);
 
   return (
     <div className="subagent-view">
       <div className="msg user subagent-task-msg">
-        <div className="role"><Icon name="task" /> Task</div>
+        <div className="role">
+          <Icon name="task" /> Task
+          {subName ? <span className="sub-chip sub-type" title={`Subagent: ${subName}`}>{subName}</span> : null}
+        </div>
         {taskPrompt ? (
           <div
             className={"subagent-prompt" + (promptOpen ? " open" : " clamp")}

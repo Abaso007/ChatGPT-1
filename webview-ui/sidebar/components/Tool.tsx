@@ -232,6 +232,10 @@ function SubagentCard({ block, onOpen, awaitingApproval }: { block: ToolBlock; o
   // Keep the card small: only the two most recent steps.
   const recent = toolSteps.slice(-2);
   const model = shortModelName(i.model);
+  // Named subagent (built-in type or a configured team member) — "generalPurpose"
+  // carries no information, so it stays hidden.
+  const subType = String(i.subagent_type || "").trim();
+  const subName = subType && subType !== "generalPurpose" ? subType : "";
   const statusKind = awaitingApproval
     ? "approval"
     : running
@@ -246,9 +250,10 @@ function SubagentCard({ block, onOpen, awaitingApproval }: { block: ToolBlock; o
     <div className={"subagent-card" + (awaitingApproval ? " needs-approval" : "")} onClick={() => onOpen?.(block.callId)} role="button" title="Open subagent">
       <div className="subagent-card-main">
         <span className="ticon"><Icon name="task" /></span>
-        <span className="label">{i.description || "Subagent"}</span>
+        <span className="label">{i.description || subName || "Subagent"}</span>
         <span className="sub-spacer" />
         <span className={"sub-status sub-status-" + statusKind}>{STATUS_LABELS[statusKind]}</span>
+        {subName ? <span className="sub-chip sub-type" title={`Subagent: ${subName}`}>{subName}</span> : null}
         {model ? <span className="sub-chip sub-model" title={String(i.model)}>{model}</span> : null}
         <span className="sub-chip sub-steps">{steps} {steps === 1 ? "step" : "steps"}</span>
         <span className="badge badge-agent">{isReadonlySubagent(i) ? "Explore" : "Agent"}</span>
