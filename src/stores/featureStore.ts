@@ -301,9 +301,9 @@ const DEFAULTS: FeatureConfig = {
 	webFetchEnabled: true,
 	approvalPolicy: DEFAULT_APPROVAL,
 	docSources: [],
-	indexingEnabled: true,
-	indexNewFolders: true,
-	indexForGrep: true,
+	indexingEnabled: false,
+	indexNewFolders: false,
+	indexForGrep: false,
 };
 
 /** Default base URLs + whether a key is required, per provider kind. */

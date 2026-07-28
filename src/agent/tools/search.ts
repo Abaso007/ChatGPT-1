@@ -232,7 +232,7 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
 
   // Read files concurrently; regex matching stays on the main thread but I/O
   // no longer serializes, which was the dominant cost in the old fallback.
-  const CONCURRENCY = 16;
+  const CONCURRENCY = 8;
   const list = candidates.slice(0, 20_000);
   let cursor = 0;
   let stopped = false;

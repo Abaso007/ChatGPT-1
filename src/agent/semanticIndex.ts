@@ -117,7 +117,10 @@ const SKIP_BASENAMES = new Set([
   "LICENSE", "LICENSE.txt", "LICENSE.md", "COPYING", "CHANGELOG.md", "CHANGELOG",
   "package-lock.json",
 ]);
-const MAX_FILE_BYTES = 512 * 1024;
+const MAX_FILE_BYTES = 256 * 1024;
+const MAX_INDEX_FILES = 25_000;
+const MAX_INDEX_SCAN_MS = 30_000;
+const SAVE_EVERY_FILES = 100;
 
 export interface Chunk {
   path: string; // workspace-relative, posix
@@ -576,9 +579,10 @@ export async function buildIndex(root: string, onProgress?: (done: number, total
     const idx = await load(root);
     // Parallel scan + mtime/size in one pass (replaces serial walk + per-file stat).
     const { files: scanned } = await scanFiles(root, {
-      maxFiles: 100_000,
-      timeMs: 60_000,
+      maxFiles: MAX_INDEX_FILES,
+      timeMs: MAX_INDEX_SCAN_MS,
       useGitignore: true,
+      dirFilter: (rel) => isIndexableRel(`${rel}/placeholder.ts`),
     });
     const targets: string[] = [];
     const seen = new Set<string>();
@@ -616,8 +620,9 @@ export async function buildIndex(root: string, onProgress?: (done: number, total
       progress = { done, total: targets.length };
       onProgress?.(done, targets.length);
       emitStatus(root);
-      // Persist periodically so reopen mid-index keeps progress.
-      if (done % 25 === 0) await save(root, idx);
+      // Persist periodically so reopen mid-index keeps progress without repeatedly
+      // serializing and rewriting a potentially large index.
+      if (done % SAVE_EVERY_FILES === 0) await save(root, idx);
     }
     await save(root, idx);
   } finally {

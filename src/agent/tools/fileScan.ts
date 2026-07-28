@@ -261,7 +261,7 @@ export function normalizeGlobPattern(pattern: string): string {
 // Parallel directory walk
 // ---------------------------------------------------------------------------
 
-const DIR_CONCURRENCY = 24;
+const DIR_CONCURRENCY = 8;
 
 /**
  * Breadth-first, bounded-concurrency scan. Returns file metadata (size/mtime)

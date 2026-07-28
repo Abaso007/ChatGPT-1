@@ -87,10 +87,12 @@ export function initIndexWatch(context: vscode.ExtensionContext, store: FeatureS
   let lastEnabled = store.get().indexingEnabled !== false;
   setIndexingEnabled(lastEnabled);
 
-  const root = getWorkspaceRoot();
-  void warmIndex(root).then(() => {
-    if (lastEnabled) void buildIndex(root).catch((error) => logError("index.build", error, { root }));
-  }).catch((error) => logError("index.warm", error, { root }));
+  if (lastEnabled) {
+    const root = getWorkspaceRoot();
+    void warmIndex(root)
+      .then(() => buildIndex(root))
+      .catch((error) => logError("index.build", error, { root }));
+  }
 
   const watcher = vscode.workspace.createFileSystemWatcher("**/*");
   context.subscriptions.push(
