@@ -361,6 +361,9 @@ function keywordFallback(input: any, abortSignal?: AbortSignal, callId?: string,
   return grepTool.execute({ pattern: words.join("|"), "-i": true, path: scope }, abortSignal, callId, ctx);
 }
 
+const AUTO_BUILD_MIN_INTERVAL_MS = 5 * 60_000;
+let lastAutoBuild = 0;
+
 export const semanticSearchTool = defineTool("SemanticSearch", false, async (input, abortSignal, callId, ctx) => {
   try {
   if (abortSignal?.aborted) return { output: "(search aborted)" };
@@ -370,7 +373,12 @@ export const semanticSearchTool = defineTool("SemanticSearch", false, async (inp
 
   // Build/refresh index on demand (incremental; cheap if already fresh).
   // Never await a full rebuild here — that hung explore tools for minutes.
-  if (isIndexingEnabled() && !isIndexing()) void buildIndex(root).catch(() => {});
+  // Throttled: the watcher already keeps the index current, so a full workspace
+  // scan on every single SemanticSearch call is pure overhead.
+  if (isIndexingEnabled() && !isIndexing() && Date.now() - lastAutoBuild > AUTO_BUILD_MIN_INTERVAL_MS) {
+    lastAutoBuild = Date.now();
+    void buildIndex(root).catch(() => {});
+  }
 
   // Scope by target_directories (prefix match on workspace-relative paths).
   const dirs: string[] = Array.isArray(input.target_directories) ? input.target_directories : [];

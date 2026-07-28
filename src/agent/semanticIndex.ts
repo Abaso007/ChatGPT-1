@@ -10,15 +10,18 @@
 // Real local semantic codebase index.
 // - Embeddings: @huggingface/transformers + onnxruntime-node
 //   (Xenova/all-MiniLM-L6-v2, q8). GPU when available (DML/CUDA/CoreML/WebGPU),
-//   else CPU. 100% local; model downloads once to globalStorage.
+//   else CPU with a bounded thread pool so the extension host stays responsive.
 // - Chunking: sliding line-window per file (simple, language-agnostic).
 //   ponytail: line-window chunking; upgrade to tree-sitter AST chunks when
 //   ranking quality on large funcs matters.
-// - Store: plain JSON in globalStorage + in-memory cosine top-k.
+// - Store: chunk metadata in JSON + vectors in a packed Float32Array sidecar
+//   (`.vec`). Chunk text is NOT kept in memory; snippets are read from disk for
+//   the top-k hits only.
 //   ponytail: O(n) cosine scan; swap for sqlite-vec/HNSW when repo > ~50k chunks.
 // - Incremental: per-file mtime hash skips unchanged files on re-index.
 
 import * as fs from "fs/promises";
+import * as os from "os";
 import * as path from "path";
 import * as crypto from "crypto";
 import { scanFiles } from "./tools/fileScan";
@@ -81,6 +84,19 @@ export function setRemoteEmbedModel(cfg: RemoteEmbedConfig): void {
 
 const CHUNK_LINES = 40;
 const CHUNK_OVERLAP = 10;
+/** Hard cap per chunk so one minified-ish line can't blow up a forward pass. */
+const MAX_CHUNK_CHARS = 4000;
+/** Texts per embedder forward pass, and the char budget that also closes a batch. */
+const EMBED_BATCH_TEXTS = 24;
+const EMBED_BATCH_CHARS = 24_000;
+/** Status pushes to the UI are coalesced to this interval during builds. */
+const STATUS_THROTTLE_MS = 300;
+/** Index is persisted at most this often mid-build (plus once at the end). */
+const SAVE_THROTTLE_MS = 8_000;
+/** Yield to the event loop at least this often so the extension host stays live. */
+const YIELD_EVERY_MS = 40;
+/** Snippet length hydrated per search hit. */
+const SNIPPET_MAX_CHARS = 2000;
 /** Source / doc extensions worth embedding. No binaries, lockfiles, or assets. */
 const EMBED_EXTS = new Set([
   ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs",
@@ -115,21 +131,36 @@ const SKIP_BASENAMES = new Set([
   "go.sum", "flake.lock", "uv.lock",
   ".DS_Store", "Thumbs.db", "desktop.ini",
   "LICENSE", "LICENSE.txt", "LICENSE.md", "COPYING", "CHANGELOG.md", "CHANGELOG",
-  "package-lock.json",
 ]);
 const MAX_FILE_BYTES = 512 * 1024;
 
+/** Chunk location in the workspace. Text lives on disk, not here. */
 export interface Chunk {
   path: string; // workspace-relative, posix
-  start: number; // 1-based
-  end: number;
-  text: string;
-  vec: number[]; // normalized, length = model dim
+  start: number; // 1-based, inclusive
+  end: number; // 1-based, inclusive
 }
-interface IndexFile {
-  model: string; // EmbedModel.id the vectors were built with
+
+/**
+ * In-memory index. Vectors are one packed Float32Array (`vecs`) whose row i
+ * belongs to `metas[i]`, which keeps ~8x less memory than an array of number[]
+ * and makes the cosine scan a contiguous walk.
+ */
+interface IndexData {
+  model: string;
+  dim: number;
   files: Record<string, string>; // relPath -> mtime+size hash
-  chunks: Chunk[];
+  metas: Chunk[];
+  vecs: Float32Array; // capacity may exceed count * dim
+  count: number; // rows in use
+}
+
+interface MetaFile {
+  v: 2;
+  model: string;
+  dim: number;
+  files: Record<string, string>;
+  metas: [string, number, number][]; // [path, start, end] — compact on disk
 }
 
 let storageDir: string | undefined;
@@ -157,6 +188,15 @@ function preferredEmbedDevices(): string[] {
   return order;
 }
 
+/**
+ * ORT defaults to one intra-op thread per core, which saturates the machine and
+ * starves the extension host. Leave at least half the cores to the editor.
+ */
+function cpuThreadBudget(): number {
+  const cores = Math.max(1, os.cpus()?.length || 1);
+  return Math.max(1, Math.min(4, Math.floor(cores / 2)));
+}
+
 let extractorP: Promise<any> | null = null;
 let embedDevice: string | null = null;
 
@@ -176,12 +216,17 @@ async function getExtractor(): Promise<any | null> {
       // Try GPU EPs first; ORT often fails hard if a provider's libs are missing,
       // so probe one device at a time instead of device:"auto".
       const devices = preferredEmbedDevices();
+      const threads = cpuThreadBudget();
       let lastErr: unknown;
       for (const device of devices) {
         try {
           const pipe = await t.pipeline("feature-extraction", m.repo, {
             dtype: m.dtype,
             device,
+            session_options:
+              device === "cpu"
+                ? { intraOpNumThreads: threads, interOpNumThreads: 1, executionMode: "sequential" }
+                : undefined,
           });
           embedDevice = device;
           console.log(`[semanticIndex] embedder on ${device} (${m.id})`);
@@ -202,6 +247,18 @@ async function getExtractor(): Promise<any | null> {
     });
   }
   return extractorP;
+}
+
+/** Free the embedder + its ONNX session. Called when indexing is turned off. */
+export async function releaseEmbedder(): Promise<void> {
+  const p = extractorP;
+  extractorP = null;
+  embedDevice = null;
+  if (!p) return;
+  try {
+    const ex = await p;
+    await ex?.dispose?.();
+  } catch {}
 }
 
 /** Embed via a provider's OpenAI-compatible /embeddings endpoint. */
@@ -235,6 +292,8 @@ async function embed(texts: string[]): Promise<number[][] | null> {
   if (!ex) return null;
   const out = await ex(texts, { pooling: activeModel.pooling, normalize: true });
   const data = out.tolist ? out.tolist() : out;
+  // Release the backing tensor buffer promptly instead of waiting for GC.
+  try { out?.dispose?.(); } catch {}
   return data as number[][];
 }
 
@@ -255,45 +314,153 @@ function normRoot(root: string): string {
   return process.platform === "win32" ? r.toLowerCase() : r;
 }
 
-function indexPath(root: string): string {
+function indexBase(root: string): string {
   const id = crypto.createHash("sha1").update(normRoot(root)).digest("hex").slice(0, 16);
   const mid = getEmbedModelId().replace(/[^\w.-]+/g, "_");
-  return path.join(storageDir!, `index-${id}-${mid}.json`);
+  return path.join(storageDir!, `index-${id}-${mid}`);
+}
+function metaPath(root: string): string {
+  return `${indexBase(root)}.json`;
+}
+function vecPath(root: string): string {
+  return `${indexBase(root)}.vec`;
 }
 
-let memIndex: IndexFile | null = null;
+let memIndex: IndexData | null = null;
 let memRoot: string | null = null; // normRoot key
 let indexingEnabled = true;
 
 export function setIndexingEnabled(on: boolean): void {
   indexingEnabled = on;
+  if (!on) {
+    // Drop the ONNX session and the vector matrix; both are large and idle now.
+    void releaseEmbedder();
+    memIndex = null;
+    memRoot = null;
+  }
 }
 
 export function isIndexingEnabled(): boolean {
   return indexingEnabled;
 }
 
-async function load(root: string): Promise<IndexFile> {
+function activeDim(): number {
+  return remoteCfg ? 0 : activeModel.dim; // remote dim is discovered on first embed
+}
+
+function emptyIndex(): IndexData {
+  return { model: getEmbedModelId(), dim: activeDim(), files: {}, metas: [], vecs: new Float32Array(0), count: 0 };
+}
+
+/** Grow the packed matrix geometrically so pushes stay amortized O(1). */
+function reserve(idx: IndexData, rows: number): void {
+  if (!idx.dim) return;
+  const need = rows * idx.dim;
+  if (idx.vecs.length >= need) return;
+  const next = new Float32Array(Math.max(need, Math.max(idx.vecs.length * 2, 4096 * idx.dim)));
+  next.set(idx.vecs.subarray(0, idx.count * idx.dim));
+  idx.vecs = next;
+}
+
+function pushChunk(idx: IndexData, meta: Chunk, vec: number[]): void {
+  if (!idx.dim) idx.dim = vec.length;
+  if (vec.length !== idx.dim) return;
+  reserve(idx, idx.count + 1);
+  idx.vecs.set(vec, idx.count * idx.dim);
+  idx.metas.push(meta);
+  idx.count++;
+}
+
+/**
+ * Drop every row whose path fails `keep`, compacting the matrix in place.
+ * One pass, no reallocation — used for single-file updates and full sweeps.
+ */
+function retainChunks(idx: IndexData, keep: (rel: string) => boolean): void {
+  if (!idx.count) return;
+  const dim = idx.dim;
+  let w = 0;
+  const metas: Chunk[] = [];
+  for (let r = 0; r < idx.count; r++) {
+    const m = idx.metas[r];
+    if (!keep(m.path)) continue;
+    if (w !== r) idx.vecs.copyWithin(w * dim, r * dim, (r + 1) * dim);
+    metas.push(m);
+    w++;
+  }
+  idx.metas = metas;
+  idx.count = w;
+}
+
+function dropPath(idx: IndexData, rel: string): void {
+  if (!idx.files[rel] && !idx.metas.some((m) => m.path === rel)) return;
+  retainChunks(idx, (p) => p !== rel);
+}
+
+async function readLegacyIndex(root: string): Promise<IndexData | null> {
+  // v1 stored everything (including per-chunk text and number[] vectors) in the
+  // JSON file. Convert once, then persist in the v2 packed format.
+  try {
+    const raw = await fs.readFile(metaPath(root), "utf8");
+    const parsed: any = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.chunks)) return null;
+    if (parsed.model !== getEmbedModelId()) return null;
+    const idx = emptyIndex();
+    idx.files = parsed.files && typeof parsed.files === "object" ? parsed.files : {};
+    reserve(idx, parsed.chunks.length);
+    for (const c of parsed.chunks) {
+      if (!c?.path || !Array.isArray(c.vec)) continue;
+      pushChunk(idx, { path: c.path, start: c.start, end: c.end }, c.vec);
+    }
+    return idx;
+  } catch {
+    return null;
+  }
+}
+
+async function load(root: string): Promise<IndexData> {
   const key = normRoot(root);
   if (memIndex && memRoot === key) return memIndex;
+  memRoot = key;
   try {
-    const raw = await fs.readFile(indexPath(root), "utf8");
-    const parsed = JSON.parse(raw) as IndexFile;
-    if (parsed.model === getEmbedModelId() && parsed.files && Array.isArray(parsed.chunks)) {
-      memIndex = parsed;
-      memRoot = key;
-      return parsed;
+    const raw = await fs.readFile(metaPath(root), "utf8");
+    const meta = JSON.parse(raw) as MetaFile;
+    if (meta?.v === 2 && meta.model === getEmbedModelId() && Array.isArray(meta.metas)) {
+      const buf = await fs.readFile(vecPath(root));
+      const dim = meta.dim || activeDim();
+      const rows = dim ? Math.min(meta.metas.length, Math.floor(buf.byteLength / (dim * 4))) : 0;
+      const vecs = new Float32Array(rows * dim);
+      // Copy out of the Buffer: its byteOffset may be unaligned for Float32.
+      Buffer.from(vecs.buffer).set(buf.subarray(0, rows * dim * 4));
+      memIndex = {
+        model: meta.model,
+        dim,
+        files: meta.files || {},
+        metas: meta.metas.slice(0, rows).map(([p, s, e]) => ({ path: p, start: s, end: e })),
+        vecs,
+        count: rows,
+      };
+      return memIndex;
     }
   } catch {}
-  memIndex = { model: getEmbedModelId(), files: {}, chunks: [] };
-  memRoot = key;
+  const migrated = await readLegacyIndex(root);
+  memIndex = migrated ?? emptyIndex();
+  if (migrated) await save(root, migrated);
   return memIndex;
 }
 
-async function save(root: string, idx: IndexFile): Promise<void> {
+async function save(root: string, idx: IndexData): Promise<void> {
   if (!storageDir) return;
   await fs.mkdir(storageDir, { recursive: true });
-  await fs.writeFile(indexPath(root), JSON.stringify(idx), "utf8");
+  const meta: MetaFile = {
+    v: 2,
+    model: idx.model,
+    dim: idx.dim,
+    files: idx.files,
+    metas: idx.metas.map((m) => [m.path, m.start, m.end]),
+  };
+  const rows = idx.count * idx.dim;
+  await fs.writeFile(vecPath(root), Buffer.from(idx.vecs.buffer, 0, rows * 4));
+  await fs.writeFile(metaPath(root), JSON.stringify(meta), "utf8");
   memIndex = idx;
   memRoot = normRoot(root);
 }
@@ -306,14 +473,19 @@ export async function warmIndex(root: string): Promise<IndexStatus> {
   return getStatus(root);
 }
 
-function chunkFile(rel: string, text: string): { start: number; end: number; text: string }[] {
+function chunkFile(text: string): { start: number; end: number; text: string }[] {
   const lines = text.split("\n");
   const out: { start: number; end: number; text: string }[] = [];
   for (let i = 0; i < lines.length; i += CHUNK_LINES - CHUNK_OVERLAP) {
     const slice = lines.slice(i, i + CHUNK_LINES);
     const body = slice.join("\n").trim();
-    if (!body) continue;
-    out.push({ start: i + 1, end: Math.min(i + CHUNK_LINES, lines.length), text: body });
+    if (body) {
+      out.push({
+        start: i + 1,
+        end: Math.min(i + CHUNK_LINES, lines.length),
+        text: body.length > MAX_CHUNK_CHARS ? body.slice(0, MAX_CHUNK_CHARS) : body,
+      });
+    }
     if (i + CHUNK_LINES >= lines.length) break;
   }
   return out;
@@ -391,7 +563,7 @@ export function getStatus(root: string): IndexStatus {
     done: progress.done,
     total: progress.total,
     files: idx ? Object.keys(idx.files).length : 0,
-    chunks: idx ? idx.chunks.length : 0,
+    chunks: idx ? idx.count : 0,
     model: getEmbedModelId(),
     backend,
     device,
@@ -406,17 +578,38 @@ export function getStatus(root: string): IndexStatus {
     platform: `${process.platform}-${process.arch}`,
   };
 }
+
 function emitStatus(root: string): void {
+  if (statusTimer) {
+    clearTimeout(statusTimer);
+    statusTimer = null;
+  }
+  lastStatusAt = Date.now();
+  if (!statusSubs.size) return;
   const s = getStatus(root);
   for (const fn of statusSubs) fn(s);
 }
 
+// Per-file progress used to fire a postMessage per file; coalesce it instead.
+let statusTimer: ReturnType<typeof setTimeout> | null = null;
+let lastStatusAt = 0;
+function emitStatusThrottled(root: string): void {
+  if (!statusSubs.size) return;
+  if (statusTimer) return;
+  const wait = Math.max(0, STATUS_THROTTLE_MS - (Date.now() - lastStatusAt));
+  statusTimer = setTimeout(() => {
+    statusTimer = null;
+    emitStatus(root);
+  }, wait);
+}
+
 /** Delete the persisted index for a workspace. */
 export async function deleteIndex(root: string): Promise<void> {
-  memIndex = { model: getEmbedModelId(), files: {}, chunks: [] };
+  memIndex = emptyIndex();
   memRoot = normRoot(root);
   progress = { done: 0, total: 0 };
-  try { await fs.unlink(indexPath(root)); } catch {}
+  try { await fs.unlink(metaPath(root)); } catch {}
+  try { await fs.unlink(vecPath(root)); } catch {}
   emitStatus(root);
 }
 
@@ -447,21 +640,47 @@ function isIndexableRel(rel: string): boolean {
   return true;
 }
 
-async function embedFileInto(idx: IndexFile, root: string, rel: string): Promise<boolean> {
+/**
+ * Collects chunks from many files and embeds them in batched forward passes.
+ * Batching is the difference between one ONNX call per chunk and one per ~24,
+ * which dominates build cost.
+ */
+class BatchEmbedder {
+  private queue: { meta: Chunk; text: string }[] = [];
+  private chars = 0;
+
+  constructor(private readonly idx: IndexData) {}
+
+  async add(meta: Chunk, text: string): Promise<void> {
+    this.queue.push({ meta, text });
+    this.chars += text.length;
+    if (this.queue.length >= EMBED_BATCH_TEXTS || this.chars >= EMBED_BATCH_CHARS) await this.flush();
+  }
+
+  async flush(): Promise<void> {
+    if (!this.queue.length) return;
+    const batch = this.queue;
+    this.queue = [];
+    this.chars = 0;
+    const vecs = await embed(batch.map((b) => b.text));
+    if (!vecs) return;
+    for (let i = 0; i < batch.length; i++) {
+      const v = vecs[i];
+      if (v) pushChunk(this.idx, batch[i].meta, v);
+    }
+  }
+}
+
+async function embedFileInto(embedder: BatchEmbedder, idx: IndexData, root: string, rel: string): Promise<boolean> {
   const abs = path.join(root, rel);
   let st;
   try { st = await fs.stat(abs); } catch { return false; }
   if (st.size > MAX_FILE_BYTES) return false;
   let text: string;
   try { text = await fs.readFile(abs, "utf8"); } catch { return false; }
-  // Drop old chunks for this path first.
-  idx.chunks = idx.chunks.filter((c) => c.path !== rel);
-  const pieces = chunkFile(rel, text);
-  if (pieces.length) {
-    const vecs = await embed(pieces.map((p) => p.text));
-    if (vecs) {
-      pieces.forEach((p, i) => idx.chunks.push({ path: rel, start: p.start, end: p.end, text: p.text, vec: vecs[i] }));
-    }
+  dropPath(idx, rel);
+  for (const p of chunkFile(text)) {
+    await embedder.add({ path: rel, start: p.start, end: p.end }, p.text);
   }
   idx.files[rel] = `${Math.round(st.mtimeMs)}:${st.size}`;
   return true;
@@ -497,7 +716,9 @@ export async function upsertFile(root: string, absOrRel: string): Promise<void> 
   }
   const hash = `${Math.round(st.mtimeMs)}:${st.size}`;
   if (idx.files[rel] === hash || idx.files[rel] === `${st.mtimeMs}:${st.size}`) return;
-  await embedFileInto(idx, root, rel);
+  const embedder = new BatchEmbedder(idx);
+  await embedFileInto(embedder, idx, root, rel);
+  await embedder.flush();
   await save(root, idx);
   emitStatus(root);
 }
@@ -516,8 +737,8 @@ export async function removeFile(root: string, absOrRel: string): Promise<void> 
     return;
   }
   const idx = await load(root);
-  if (!idx.files[rel] && !idx.chunks.some((c) => c.path === rel)) return;
-  idx.chunks = idx.chunks.filter((c) => c.path !== rel);
+  if (!idx.files[rel] && !idx.metas.some((m) => m.path === rel)) return;
+  dropPath(idx, rel);
   delete idx.files[rel];
   await save(root, idx);
   emitStatus(root);
@@ -533,10 +754,9 @@ async function drainPending(root: string): Promise<void> {
   try {
     const idx = await load(root);
     if (dels?.size) {
-      for (const rel of dels) {
-        idx.chunks = idx.chunks.filter((c) => c.path !== rel);
-        delete idx.files[rel];
-      }
+      const gone = new Set(dels);
+      retainChunks(idx, (p) => !gone.has(p));
+      for (const rel of gone) delete idx.files[rel];
       dels.clear();
     }
     if (ups?.size) {
@@ -545,13 +765,15 @@ async function drainPending(root: string): Promise<void> {
       progress = { done: 0, total: list.length };
       indexing = true;
       emitStatus(root);
+      const embedder = new BatchEmbedder(idx);
       let done = 0;
       for (const rel of list) {
-        await embedFileInto(idx, root, rel);
+        await embedFileInto(embedder, idx, root, rel);
         done++;
         progress = { done, total: list.length };
-        emitStatus(root);
+        emitStatusThrottled(root);
       }
+      await embedder.flush();
       indexing = false;
     }
     await save(root, idx);
@@ -593,7 +815,7 @@ export async function buildIndex(root: string, onProgress?: (done: number, total
       if (prev !== hash && prev !== `${f.mtimeMs}:${f.size}`) targets.push(rel);
     }
     const changed = new Set(targets);
-    idx.chunks = idx.chunks.filter((c) => seen.has(c.path) && !changed.has(c.path));
+    retainChunks(idx, (p) => seen.has(p) && !changed.has(p));
     for (const rel of Object.keys(idx.files)) {
       if (!seen.has(rel)) delete idx.files[rel];
     }
@@ -607,24 +829,66 @@ export async function buildIndex(root: string, onProgress?: (done: number, total
     let done = 0;
     progress = { done: 0, total: targets.length };
     emitStatus(root);
+    reserve(idx, idx.count + targets.length * 4); // ~4 chunks/file, one allocation
+    const embedder = new BatchEmbedder(idx);
+    let lastSave = Date.now();
+    let lastYield = Date.now();
     for (const rel of targets) {
-      await embedFileInto(idx, root, rel);
-      // Prefer stable rounded hash going forward.
-      const st = await fs.stat(path.join(root, rel)).catch(() => null);
-      if (st) idx.files[rel] = `${Math.round(st.mtimeMs)}:${st.size}`;
+      if (!indexingEnabled) break;
+      await embedFileInto(embedder, idx, root, rel);
       done++;
       progress = { done, total: targets.length };
       onProgress?.(done, targets.length);
-      emitStatus(root);
-      // Persist periodically so reopen mid-index keeps progress.
-      if (done % 25 === 0) await save(root, idx);
+      emitStatusThrottled(root);
+      // Persist periodically so reopen mid-index keeps progress, but time-based
+      // rather than every 25 files — the whole matrix is rewritten each save.
+      if (Date.now() - lastSave > SAVE_THROTTLE_MS) {
+        await embedder.flush();
+        await save(root, idx);
+        lastSave = Date.now();
+      }
+      if (Date.now() - lastYield > YIELD_EVERY_MS) {
+        await new Promise<void>((r) => setImmediate(r));
+        lastYield = Date.now();
+      }
     }
-    await save(root, idx);
+    await embedder.flush();
+    if (indexingEnabled) await save(root, idx);
   } finally {
     indexing = false;
     emitStatus(root);
     void drainPending(root);
   }
+}
+
+/** Read the line range for each hit straight from disk (chunk text isn't cached). */
+async function hydrate(
+  root: string,
+  hits: { meta: Chunk; score: number }[]
+): Promise<{ path: string; start: number; end: number; text: string; score: number }[]> {
+  const byFile = new Map<string, string[] | null>();
+  const out: { path: string; start: number; end: number; text: string; score: number }[] = [];
+  for (const h of hits) {
+    if (!byFile.has(h.meta.path)) {
+      try {
+        const raw = await fs.readFile(path.join(root, h.meta.path), "utf8");
+        byFile.set(h.meta.path, raw.split("\n"));
+      } catch {
+        byFile.set(h.meta.path, null);
+      }
+    }
+    const lines = byFile.get(h.meta.path);
+    if (!lines) continue; // file vanished since indexing
+    const text = lines.slice(h.meta.start - 1, h.meta.end).join("\n").trim();
+    out.push({
+      path: h.meta.path,
+      start: h.meta.start,
+      end: h.meta.end,
+      text: text.length > SNIPPET_MAX_CHARS ? text.slice(0, SNIPPET_MAX_CHARS) : text,
+      score: h.score,
+    });
+  }
+  return out;
 }
 
 /** Cosine top-k. Returns [] if index empty / embedder unavailable. */
@@ -637,16 +901,25 @@ export async function search(
   const qv = await embedQuery(query);
   if (!qv) return [];
   const idx = await load(root);
-  if (!idx.chunks.length) return [];
-  const dim = qv.length;
-  const scored: { c: Chunk; score: number }[] = [];
-  for (const c of idx.chunks) {
-    if (filter && !filter(c.path)) continue;
-    if (c.vec.length !== dim) continue;
+  if (!idx.count || !idx.dim || qv.length !== idx.dim) return [];
+  const dim = idx.dim;
+  const q = Float32Array.from(qv);
+  const vecs = idx.vecs;
+  // Bounded top-k instead of scoring every chunk into an array and sorting it.
+  const top: { meta: Chunk; score: number }[] = [];
+  let floor = -Infinity;
+  for (let r = 0; r < idx.count; r++) {
+    const meta = idx.metas[r];
+    if (filter && !filter(meta.path)) continue;
+    const base = r * dim;
     let dot = 0;
-    for (let i = 0; i < dim; i++) dot += qv[i] * c.vec[i]; // both normalized → cosine
-    scored.push({ c, score: dot });
+    for (let i = 0; i < dim; i++) dot += q[i] * vecs[base + i]; // both normalized → cosine
+    if (top.length === k && dot <= floor) continue;
+    let pos = top.length;
+    while (pos > 0 && top[pos - 1].score < dot) pos--;
+    top.splice(pos, 0, { meta, score: dot });
+    if (top.length > k) top.pop();
+    if (top.length === k) floor = top[k - 1].score;
   }
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, k).map(({ c, score }) => ({ path: c.path, start: c.start, end: c.end, text: c.text, score }));
+  return hydrate(root, top);
 }

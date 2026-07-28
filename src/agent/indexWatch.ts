@@ -18,10 +18,24 @@ import type { FeatureStore } from "../stores/featureStore";
 import { logError } from "../logging";
 
 const DEBOUNCE_MS = 800;
+/** Delay the activation build so it never competes with editor/extension startup. */
+const STARTUP_BUILD_DELAY_MS = 8_000;
+/** Creates/deletes only need the scan cache dropped once per burst. */
+const SCAN_INVALIDATE_MS = 300;
 const pending = new Map<string, "up" | "del">(); // abs path -> action
 let timer: ReturnType<typeof setTimeout> | null = null;
+let scanTimer: ReturnType<typeof setTimeout> | null = null;
+let startupTimer: ReturnType<typeof setTimeout> | null = null;
 let featureStore: FeatureStore | null = null;
 let flushing = false;
+
+function scheduleScanInvalidate(): void {
+  if (scanTimer) return;
+  scanTimer = setTimeout(() => {
+    scanTimer = null;
+    invalidateScanCache();
+  }, SCAN_INVALIDATE_MS);
+}
 
 function scheduleFlush(): void {
   if (timer) clearTimeout(timer);
@@ -88,22 +102,32 @@ export function initIndexWatch(context: vscode.ExtensionContext, store: FeatureS
   setIndexingEnabled(lastEnabled);
 
   const root = getWorkspaceRoot();
-  void warmIndex(root).then(() => {
-    if (lastEnabled) void buildIndex(root).catch((error) => logError("index.build", error, { root }));
-  }).catch((error) => logError("index.warm", error, { root }));
+  // Warm the persisted index right away (cheap, no embedding), but hold the
+  // build back: loading ONNX during activation is what makes startup crawl.
+  void warmIndex(root)
+    .then(() => {
+      if (!lastEnabled) return;
+      startupTimer = setTimeout(() => {
+        startupTimer = null;
+        if (!isIndexingEnabled()) return;
+        void buildIndex(root).catch((error) => logError("index.build", error, { root }));
+      }, STARTUP_BUILD_DELAY_MS);
+    })
+    .catch((error) => logError("index.warm", error, { root }));
 
   const watcher = vscode.workspace.createFileSystemWatcher("**/*");
   context.subscriptions.push(
     watcher,
-    // Creates/deletes change the file set, so the search scan cache must drop
-    // immediately — independent of whether semantic indexing is enabled.
+    // Creates/deletes change the file set, so the search scan cache must drop —
+    // independent of whether semantic indexing is enabled. Coalesced because
+    // installs and builds fire thousands of these.
     watcher.onDidCreate((u) => {
-      invalidateScanCache();
+      scheduleScanInvalidate();
       onFs(u, "up");
     }),
     watcher.onDidChange((u) => onFs(u, "up")),
     watcher.onDidDelete((u) => {
-      invalidateScanCache();
+      scheduleScanInvalidate();
       onFs(u, "del");
     }),
     vscode.workspace.onDidSaveTextDocument((doc) => onFs(doc.uri, "up")),
@@ -130,6 +154,9 @@ export function initIndexWatch(context: vscode.ExtensionContext, store: FeatureS
     {
       dispose: () => {
         if (timer) clearTimeout(timer);
+        if (scanTimer) clearTimeout(scanTimer);
+        if (startupTimer) clearTimeout(startupTimer);
+        timer = scanTimer = startupTimer = null;
         pending.clear();
       },
     },
