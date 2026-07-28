@@ -12,29 +12,27 @@ import * as path from "path";
 import type { Mode } from "../types";
 import { getWorkspaceRoot } from "../../context/workspaceUtils";
 import { pendingChanges } from "../../stores/pendingChanges";
-import { defineTool, type AskQuestionItem } from "./types";
+import { defineTool, type AskQuestionItem, type TodoItem } from "./types";
 import {
   getSubagentRunner,
   getQuestionAsker,
-  getTodos,
-  setTodos,
   slugify,
   makeDiff,
   firstDiffLine,
-  type TodoItem,
 } from "./shared";
 
 // ---- TodoWrite ----
-export const todoWriteTool = defineTool("TodoWrite", false, async (input) => {
+export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abortSignal, _callId, ctx) => {
+  if (!ctx) return { output: "error: todo context unavailable" };
   const incoming: TodoItem[] = Array.isArray(input.todos) ? input.todos : [];
   if (input.merge) {
-    const byId = new Map(getTodos().map((t) => [t.id, t]));
+    const byId = new Map(ctx.todos.map((t) => [t.id, t]));
     for (const t of incoming) byId.set(t.id, { ...byId.get(t.id), ...t });
-    setTodos([...byId.values()]);
+    ctx.todos = [...byId.values()];
   } else {
-    setTodos(incoming);
+    ctx.todos = incoming;
   }
-  const render = getTodos()
+  const render = ctx.todos
     .map((t) => {
       const mark =
         t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : t.status === "cancelled" ? "[-]" : "[ ]";
@@ -45,10 +43,10 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input) => {
 });
 
 // ---- TodoRead ----
-export const todoReadTool = defineTool("TodoRead", false, async () => {
-  const todos = getTodos();
-  if (!todos.length) return { output: "(no todos)" };
-  return { output: todos.map((t) => `- [${t.status}] ${t.content}`).join("\n") };
+export const todoReadTool = defineTool("TodoRead", false, async (_input, _abortSignal, _callId, ctx) => {
+  if (!ctx) return { output: "error: todo context unavailable" };
+  if (!ctx.todos.length) return { output: "(no todos)" };
+  return { output: ctx.todos.map((t) => `- [${t.status}] ${t.content}`).join("\n") };
 });
 
 // ---- AskQuestion (interactive wizard form in the chat UI) ----

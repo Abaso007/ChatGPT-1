@@ -16,16 +16,15 @@ import {
   renderShell,
   pushShellOutput,
   getShellSession,
-  disposeShellSession,
-  detachShellSession,
+  spawnShellCommand,
+  killShellProcess,
+  applyCwdSideEffect,
   type BgShell,
   type ShellNotify,
 } from "./shared";
-
-const SENTINEL = "__OC_SHELL_DONE__";
-const isWin = process.platform === "win32";
 /** Default foreground wait for simple commands; hard max keeps the loop responsive. */
-const DEFAULT_BLOCK_MS = 15_000;
+const DEFAULT_BLOCK_MS = 30_000;
+
 const MAX_BLOCK_MS = 30_000;
 const MAX_AWAIT_MS = 45_000;
 /** Absolute hard wall even if block_until_ms is large / tool timeout is higher. */
@@ -50,73 +49,33 @@ function buildNotify(input: any, ctx: any): ShellNotify | undefined {
   };
 }
 
-/** Quote a filesystem path for the session shell (spaces, quotes, unicode). */
-function quotePath(p: string): string {
-  if (isWin) {
-    // PowerShell single-quoted literal; escape ' by doubling. Drop trailing
-    // backslash that would escape the closing quote if we ever used doubles.
-    return `'${p.replace(/'/g, "''")}'`;
-  }
-  // bash: single-quote with '\'' for embedded quotes
-  return `'${p.replace(/'/g, `'\\''`)}'`;
-}
-
 /**
- * Frame a command so the session ALWAYS prints a sentinel with exit code.
- *
- * Critical: do NOT paste the user command raw into the script. Paths with
- * spaces, unclosed quotes, or bad syntax leave PowerShell waiting for more
- * input forever (no sentinel → tool looks "stuck"). Instead base64-encode the
- * command and Invoke-Expression / bash -c it inside try/catch/finally so
- * parse errors still emit the sentinel and free the session.
+ * Stream the rendered card to the UI while the command runs, throttled so a
+ * chatty build can't flood the webview.
  */
-function wrapCommand(command: string, cd: string): string {
-  const b64 = Buffer.from(command, "utf8").toString("base64");
-  if (isWin) {
-    const cdBlock = cd
-      ? `Push-Location -LiteralPath ${quotePath(cd)}; $__oc_pop = $true; `
-      : `$__oc_pop = $false; `;
-    // Decode → Invoke-Expression inside try; sentinel always in finally.
-    // $? / $LASTEXITCODE after IEX covers native cmds and cmdlets.
-    return (
-      `${cdBlock}` +
-      `$__oc_ok = $false; $__oc_code = 1; ` +
-      `try { ` +
-      `$ErrorActionPreference = 'Stop'; ` +
-      `$__oc_cmd = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${b64}')); ` +
-      `Invoke-Expression -Command $__oc_cmd; ` +
-      `if ($?) { $__oc_ok = $true; $__oc_code = 0 } ` +
-      `elseif ($null -ne $LASTEXITCODE -and "$LASTEXITCODE" -ne '') { $__oc_code = [int]$LASTEXITCODE } ` +
-      `else { $__oc_code = 1 } ` +
-      `} catch { ` +
-      `[Console]::Error.WriteLine($_ | Out-String); $__oc_ok = $false; ` +
-      `$__oc_code = if ($null -ne $LASTEXITCODE -and "$LASTEXITCODE" -ne '') { [int]$LASTEXITCODE } else { 1 } ` +
-      `} finally { ` +
-      `if ($__oc_pop) { Pop-Location -ErrorAction SilentlyContinue }; ` +
-      `if ($__oc_ok) { [Console]::Out.WriteLine("${SENTINEL}:0") } ` +
-      `else { [Console]::Out.WriteLine("${SENTINEL}:$__oc_code") } ` +
-      `}\n`
-    );
-  }
-  // bash: decode to a temp eval so spaces/quotes never break the outer script.
-  // Always print sentinel even if eval fails (set +e).
-  const push = cd ? `pushd ${quotePath(cd)} >/dev/null 2>&1 || true\n` : "";
-  const pop = cd ? `popd >/dev/null 2>&1 || true\n` : "";
-  return (
-    `set +e\n` +
-    `${push}` +
-    `__oc_cmd=$(printf '%s' '${b64}' | base64 -d 2>/dev/null || printf '%s' '${b64}' | base64 -D 2>/dev/null)\n` +
-    `eval "$__oc_cmd"\n` +
-    `__oc_rc=$?\n` +
-    `${pop}` +
-    `printf '%s\\n' "${SENTINEL}:$__oc_rc"\n`
-  );
+function makeLiveStream(sh: BgShell, callId: string | undefined, ctx: any): (() => void) | undefined {
+  const emit = ctx?.emitToolProgress;
+  if (!emit || !callId) return undefined;
+  let last = 0;
+  let timer: NodeJS.Timeout | undefined;
+  const send = () => {
+    last = Date.now();
+    timer = undefined;
+    try { emit(callId, renderShell(sh)); } catch { /* ignore */ }
+  };
+  return () => {
+    if (timer) return;
+    const wait = Math.max(0, 120 - (Date.now() - last));
+    timer = setTimeout(send, wait);
+    timer.unref?.();
+  };
 }
 
 // ---- Shell (stateful session; backgrounds a command past block_until_ms) ----
-export const runTerminalTool = defineTool("Shell", true, async (input, abortSignal, _callId, ctx) => {
+export const runTerminalTool = defineTool("Shell", true, async (input, abortSignal, callId, ctx) => {
   const root = getWorkspaceRoot();
-  const rawBlock = typeof input.block_until_ms === "number" ? input.block_until_ms : DEFAULT_BLOCK_MS;
+  const requestedBlock = Number(input.block_until_ms);
+  const rawBlock = Number.isFinite(requestedBlock) ? requestedBlock : DEFAULT_BLOCK_MS;
   const blockMs = rawBlock <= 0 ? 0 : Math.min(Math.max(0, rawBlock), MAX_BLOCK_MS);
   const command = String(input.command ?? "").trim();
   if (!command) return { output: "error: command is required" };
@@ -127,186 +86,129 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
   }
 
   const sessionKey = (ctx as any)?.shellSessionKey ?? "default";
-  let session = getShellSession(sessionKey, root);
+  const session = getShellSession(sessionKey, root);
 
-  // Serialize commands on this session so sentinels don't interleave.
+  // Serialize foreground commands per run so their output can't interleave.
   // Always settle the queue slot even if this command errors/times out.
   let releaseQueue!: () => void;
   const prev = session.queue.catch(() => {});
   session.queue = new Promise<void>((r) => {
     releaseQueue = r;
   });
-  try {
-    // Never block forever on a stuck prior command's queue slot.
-    await Promise.race([
-      prev,
-      new Promise<void>((r) => setTimeout(r, MAX_BLOCK_MS + 5_000)),
-    ]);
-  } catch {
-    /* ignore prior failure */
-  }
-  // Session may have been replaced while we waited.
-  session = getShellSession(sessionKey, root);
+  await Promise.race([
+    prev,
+    new Promise<void>((resolve) => {
+      setTimeout(resolve, MAX_BLOCK_MS + 5_000).unref?.();
+    }),
+  ]);
 
-  const sh: BgShell = {
-    id: nextShellId(),
-    command,
-    proc: session.proc,
-    output: "",
-    done: false,
-    exitCode: null,
-    startedAt: Date.now(),
-    notify: buildNotify(input, ctx),
-  };
-  bgShells.set(sh.id, sh);
-
-  const startLen = session.buffer.length;
-  let lastSeen = startLen;
-  const sentinelRe = new RegExp(SENTINEL + ":(-?\\d+)");
-
-  sh.pump = () => {
-    try {
-      if (session.buffer.length > lastSeen) {
-        pushShellOutput(sh, session.buffer.slice(lastSeen));
-        lastSeen = session.buffer.length;
-      }
-      const m = sh.output.match(sentinelRe);
-      if (m && !sh.done) {
-        sh.exitCode = Number(m[1]);
-        sh.done = true;
-      }
-      // Dead process with no sentinel → force complete so we never hang.
-      if (!sh.done && (session.proc.killed || session.proc.exitCode != null)) {
-        sh.exitCode = session.proc.exitCode ?? 1;
-        sh.done = true;
-        sh.output += "\n(shell session exited)";
-      }
-    } catch (e) {
-      if (!sh.done) {
-        sh.done = true;
-        sh.exitCode = 1;
-        sh.output += `\n(pump error: ${e instanceof Error ? e.message : String(e)})`;
-      }
-    }
-  };
-
-  const killSession = () => {
-    try {
-      disposeShellSession(sessionKey);
-    } catch {
-      /* ignore */
-    }
-  };
-  const onAbort = () => {
-    if (!sh.done) {
-      sh.output += "\n(aborted)";
-      sh.done = true;
-      sh.exitCode = sh.exitCode ?? 130;
-    }
-    killSession();
-  };
-  abortSignal?.addEventListener("abort", onAbort);
-
-  let cd = "";
+  let cwd = session.cwd || root;
   if (input.working_directory) {
     try {
-      cd = safePath(String(input.working_directory));
+      cwd = safePath(String(input.working_directory));
     } catch (e) {
-      abortSignal?.removeEventListener("abort", onAbort);
-      sh.done = true;
-      sh.exitCode = 1;
       releaseQueue();
       return {
         output: `error: invalid working_directory: ${e instanceof Error ? e.message : String(e)}`,
       };
     }
   }
-  const wrapped = wrapCommand(command, cd);
 
-  try {
-    const stdin = session.proc.stdin;
-    if (!stdin || stdin.destroyed) {
-      killSession();
-      session = getShellSession(sessionKey, root);
-      sh.proc = session.proc;
-    }
-    const ok = session.proc.stdin?.write(wrapped);
-    if (ok === false) {
-      // Backpressure: wait briefly for drain, then continue (pump still works).
-      await new Promise<void>((r) => {
-        const t = setTimeout(r, 2_000);
-        session.proc.stdin?.once("drain", () => {
-          clearTimeout(t);
-          r();
-        });
-      });
-    }
-  } catch (e) {
-    abortSignal?.removeEventListener("abort", onAbort);
+  const sh: BgShell = {
+    id: nextShellId(),
+    command,
+    output: "",
+    done: false,
+    exitCode: null,
+    startedAt: Date.now(),
+    status: "running",
+    cwd,
+    notify: buildNotify(input, ctx),
+  };
+  bgShells.set(sh.id, sh);
+  const live = makeLiveStream(sh, callId, ctx);
+  if (live) sh.onChunk = () => live();
+
+  /** Single place that settles a command so status/exit/timing stay consistent. */
+  const settle = (status: BgShell["status"], code: number | null, note?: string) => {
+    if (sh.done) return;
+    if (note) sh.output += `\n${note}`;
+    sh.exitCode = code;
+    sh.status = status;
     sh.done = true;
-    sh.exitCode = 1;
-    releaseQueue();
-    return {
-      output: `error: shell write failed: ${e instanceof Error ? e.message : String(e)}`,
-    };
-  }
+    sh.endedAt = Date.now();
+    live?.();
+  };
 
-  // Cap wait by tool abort + hard wall so Shell never outlives its countdown.
+  // Spawn the command verbatim in its own shell: it owns its exit code and the
+  // shell dies with it, so there is nothing left to wait on once it finishes.
+  let proc: ReturnType<typeof spawnShellCommand>;
+  try {
+    proc = spawnShellCommand(command, cwd);
+  } catch (e) {
+    releaseQueue();
+    settle("failed", 1);
+    return { output: `error: failed to start shell: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  sh.proc = proc;
+  session.running.add(proc);
+
+  const kill = () => killShellProcess(proc);
+  const onAbort = () => {
+    settle("aborted", sh.exitCode ?? 130, "(aborted)");
+    kill();
+  };
+  abortSignal?.addEventListener("abort", onAbort);
+
+  const onData = (d: Buffer | string) => {
+    try { pushShellOutput(sh, d.toString()); } catch { /* ignore */ }
+  };
+  proc.stdout?.on("data", onData);
+  proc.stderr?.on("data", onData);
+  proc.on("error", (error) => {
+    settle("failed", sh.exitCode ?? 1, `(failed to run command: ${error.message})`);
+  });
+  // 'close' (not 'exit') so all stdio has been flushed before we settle.
+  proc.on("close", (code, signal) => {
+    session.running.delete(proc);
+    if (signal) sh.signal = String(signal);
+    const exit = code ?? (signal ? 143 : 0);
+    if (sh.status === "aborted" || sh.done) {
+      sh.exitCode = sh.exitCode ?? exit;
+      return;
+    }
+    settle(exit === 0 ? "completed" : "failed", exit);
+  });
+  // Output is pushed by the stream listeners; pump only refreshes timing.
+  sh.pump = () => { /* event-driven; nothing to pull */ };
+
   const waitMs = blockMs <= 0 ? 0 : Math.min(blockMs, SHELL_HARD_WALL_MS);
   try {
     await waitForShell(sh, waitMs, undefined, abortSignal);
-    try {
-      sh.pump?.();
-    } catch {
-      /* ignore */
-    }
 
-    // Abort/timeout: kill session immediately so the loop is free.
     if (abortSignal?.aborted && !sh.done) {
-      sh.output += "\n(aborted / timed out)";
-      sh.done = true;
-      sh.exitCode = sh.exitCode ?? 124;
-      killSession();
+      settle("aborted", sh.exitCode ?? 130, "(aborted / timed out)");
+      kill();
     } else if (!sh.done) {
-      // Foreground expiry is not command failure. Keep capturing delayed stderr
-      // (including endpoint-security diagnostics) and let AwaitShell observe it.
-      detachShellSession(sessionKey, session);
-      const bgPump = setInterval(() => {
-        try {
-          sh.pump?.();
-        } catch {
-          /* ignore */
-        }
-        if (sh.done) clearInterval(bgPump);
-      }, 100);
-      // A genuinely stuck command remains observable without poisoning the
-      // queue forever. Reset only after the background lifetime expires.
+      // Foreground expiry is not a failure: the command keeps running and stays
+      // observable through AwaitShell (dev servers, watchers, long builds).
+      sh.status = "backgrounded";
+      live?.();
       setTimeout(() => {
         if (!sh.done) {
-          sh.output += "\n(background limit reached after 10m — shell session reset)";
-          sh.done = true;
-          sh.exitCode = sh.exitCode ?? 124;
-          try {
-            if (isWin) session.proc.kill();
-            else session.proc.kill("SIGKILL");
-          } catch {
-            /* ignore */
-          }
+          settle("timeout", sh.exitCode ?? 124, "(background limit reached after 10m — command killed)");
+          kill();
         }
-        clearInterval(bgPump);
       }, 600_000).unref?.();
+    } else if (sh.status === "completed") {
+      // Only a clean `cd` moves the run's working directory.
+      applyCwdSideEffect(session, command);
     }
 
-    // Strip the sentinel line from the rendered body.
-    sh.output = sh.output.replace(new RegExp("\\n?" + SENTINEL + ":-?\\d+\\s*"), "");
     return { output: renderShell(sh) };
   } catch (e) {
-    if (!sh.done) {
-      sh.done = true;
-      sh.exitCode = 1;
-      sh.output += `\n(error: ${e instanceof Error ? e.message : String(e)})`;
-    }
-    killSession();
+    settle("failed", 1, `(error: ${e instanceof Error ? e.message : String(e)})`);
+    kill();
     return { output: renderShell(sh) };
   } finally {
     abortSignal?.removeEventListener("abort", onAbort);
@@ -315,26 +217,27 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
 });
 
 // ---- AwaitShell (poll a backgrounded shell, or just sleep) ----
-export const awaitShellTool = defineTool("AwaitShell", false, async (input, abortSignal) => {
-  const raw = typeof input?.block_until_ms === "number" ? input.block_until_ms : 15_000;
+export const awaitShellTool = defineTool("AwaitShell", false, async (input, abortSignal, callId, ctx) => {
+  const requestedBlock = Number(input?.block_until_ms);
+  const raw = Number.isFinite(requestedBlock) ? requestedBlock : 15_000;
   const blockMs = raw <= 0 ? 0 : Math.min(raw, MAX_AWAIT_MS);
   const id = input?.shell_id ? String(input.shell_id) : "";
 
   if (!id) {
     if (blockMs <= 0) return { output: "error: shell_id is required when block_until_ms is 0" };
-    await new Promise<void>((r) => {
-      const t = setTimeout(r, blockMs);
-      const onAbort = () => {
-        clearTimeout(t);
-        r();
+    const startedAt = Date.now();
+    await new Promise<void>((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        abortSignal?.removeEventListener("abort", onAbort);
+        resolve();
       };
-      if (abortSignal?.aborted) {
-        clearTimeout(t);
-        r();
-        return;
-      }
-      abortSignal?.addEventListener("abort", onAbort, { once: true });
+      const onAbort = () => finish();
+      const timer = setTimeout(finish, blockMs);
+      if (abortSignal?.aborted) finish();
+      else abortSignal?.addEventListener("abort", onAbort, { once: true });
     });
+    if (abortSignal?.aborted) return { output: `Sleep aborted after ${Date.now() - startedAt}ms.` };
     return { output: `Slept for ${blockMs}ms.` };
   }
 
@@ -357,6 +260,14 @@ export const awaitShellTool = defineTool("AwaitShell", false, async (input, abor
     }
   }
 
+  const prevChunk = sh.onChunk;
+  const live = makeLiveStream(sh, callId, ctx);
+  if (live) {
+    sh.onChunk = (chunk) => {
+      try { prevChunk?.(chunk); } catch { /* ignore */ }
+      live();
+    };
+  }
   try {
     await waitForShell(sh, blockMs, pattern, abortSignal);
     try {
@@ -364,11 +275,12 @@ export const awaitShellTool = defineTool("AwaitShell", false, async (input, abor
     } catch {
       /* ignore */
     }
-    sh.output = sh.output.replace(new RegExp("\\n?" + SENTINEL + ":-?\\d+\\s*"), "");
     return { output: renderShell(sh) };
   } catch (e) {
     return {
       output: `error: AwaitShell failed: ${e instanceof Error ? e.message : String(e)}`,
     };
+  } finally {
+    sh.onChunk = prevChunk;
   }
 });

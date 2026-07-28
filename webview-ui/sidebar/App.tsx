@@ -12,7 +12,7 @@ import { Icon } from "../shared/icons";
 import { renderMarkdown } from "../shared/markdown";
 import { vscode } from "../shared/vscode";
 import { Composer, KIND_SVG, applyFileIconTo } from "./components/Composer";
-import { ToolCard, isReadonlySubagent, TimeoutBadge, ToolTimeoutWatch, isToolCountdownActive } from "./components/Tool";
+import { ToolCard, isReadonlySubagent, TimeoutBadge, ToolTimeoutWatch, isToolCountdownActive, useLiveDisclosure } from "./components/Tool";
 import { History } from "./components/History";
 import type { AgentEvent, ApprovalMode, ApprovalRequestInfo, AssistantBlock, AssistantTurn, Attachment, ConversationSummary, ErrorBlock, InMessage, MentionItem, Mode, ModelDef, ModelOption, OutMessage, PendingChangeInfo, PersonaInfo, ThinkingBlock, ToolBlock, Turn, UserTurn } from "./types";
 import { applyEvent, applyToBlocks, closeTrailingThinking, forceSettleOpenWork, parsePartialArgs, renderMentionTokens } from "./types";
@@ -206,11 +206,12 @@ function ExploringSection({
   /** Pending approval requests keyed by tool callId (rendered on the tool card). */
   approvals?: Record<string, ApprovalRequestInfo>;
 }) {
-  const [open, setOpen] = React.useState(false);
+  const running = tools.some((t) => t.status === "running") || !!live;
+  // Expanded while exploring, collapsed into the summary once the group settles.
+  const [autoOpen, toggleOpen] = useLiveDisclosure(running);
   // A pending approval inside must be visible — force the section open.
   const hasApproval = !!approvals && tools.some((t) => t.callId && approvals[t.callId]);
-  React.useEffect(() => { if (hasApproval) setOpen(true); }, [hasApproval]);
-  const running = tools.some((t) => t.status === "running") || !!live;
+  const open = autoOpen || hasApproval;
   const current = [...tools].reverse().find((t) => t.status === "running") ?? tools[tools.length - 1];
   const subtitle = running ? capitalize(toolLabel(current.name)) : exploreSummary(tools);
   // Keep kill-at-zero active even when the group is collapsed (no ToolCard mount).
@@ -223,7 +224,7 @@ function ExploringSection({
       {timed.map((t) => (
         <ToolTimeoutWatch key={`watch-${t.callId}`} block={t} />
       ))}
-      <div className="explore-head" onClick={() => setOpen((o) => !o)}>
+      <div className="explore-head" onClick={toggleOpen}>
         <span className={"tchev" + (open ? " open" : "")}>
           <Icon name="chevD" size={12} />
         </span>
@@ -363,13 +364,13 @@ function CompactionCard({ block }: { block: import("./types").AssistantBlock & {
 }
 
 function ThinkingCard({ block }: { block: ThinkingBlock }) {
-  const [open, setOpen] = React.useState(false);
   const live = !block.endedAt;
+  const [open, toggleOpen] = useLiveDisclosure(live);
   const secs = block.endedAt && block.startedAt ? Math.max(1, Math.round((block.endedAt - block.startedAt) / 1000)) : 0;
   const title = live ? "Thinking" : secs ? `Thought for ${secs}s` : "Thought";
   return (
     <div className={"thinking-card" + (open ? " open" : "") + (live ? " live" : "")}>
-      <div className="thinking-head" onClick={() => setOpen((o) => !o)}>
+      <div className="thinking-head" onClick={toggleOpen}>
         <Icon name="brain" size={12} className="thinking-spark" />
         <span className="thinking-title">{title}</span>
         <Icon name={open ? "chevD" : "chevR"} size={12} className="thinking-chev" />
@@ -455,11 +456,9 @@ function parentTaskCallId(turns: Turn[], nestedCallId: string): string | undefin
 
 function SubagentChat({
   block,
-  onBack,
   approvals,
 }: {
   block: import("./types").ToolBlock;
-  onBack: () => void;
   approvals?: Record<string, ApprovalRequestInfo>;
 }) {
   const subDone = block.subStatus === "finished" || block.subStatus === "cancelled" || block.subStatus === "error";
@@ -471,17 +470,6 @@ function SubagentChat({
 
   return (
     <div className="subagent-view">
-      <div className="subagent-view-head">
-        <button className="sub-back" onClick={onBack}>
-          <Icon name="chevD" size={12} /> Back to chat
-        </button>
-        <span className="sub-readonly">{isReadonlySubagent(block.input) ? "read-only" : "agent"}</span>
-        {running && (
-          <button className="sub-stop" onClick={() => post({ type: "cancelSubagent", callId: block.callId, reason: "user" })}>
-            <Icon name="close" size={12} /> Stop
-          </button>
-        )}
-      </div>
       <div className="msg user subagent-task-msg">
         <div className="role"><Icon name="task" /> Task</div>
         {taskPrompt ? (
@@ -1457,7 +1445,7 @@ export function App() {
 
       <div className="chat-messages" ref={scrollRef} onScroll={onScroll}>
         {subBlock ? (
-          <SubagentChat block={subBlock} onBack={() => setSubTab(null)} approvals={approvalsByCall} />
+          <SubagentChat block={subBlock} approvals={approvalsByCall} />
         ) : !hasProviders ? (
           <div className="setup-screen">
             <img className="app-logo" src={document.getElementById("root")?.dataset.icon} alt="OpenCursor" />

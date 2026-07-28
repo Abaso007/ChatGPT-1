@@ -184,7 +184,7 @@ function TodoList({ block }: { block: ToolBlock }) {
         <span className="label">Todos</span>
         <span className="right">
           <TimeoutBadge block={block} />
-          <StatusIcon status={block.status} />
+          <StatusIcon status={block.status} callId={block.callId} />
         </span>
       </div>
       <div className="todo-list">
@@ -225,6 +225,22 @@ function SubagentCard({ block, onOpen, awaitingApproval }: { block: ToolBlock; o
     : running
       ? subagentActivity(block.subBlocks)
       : undefined;
+  // Live progress inline while it works; folds away once the subagent settles.
+  // Steps follow the run itself — no manual disclosure on subagent cards.
+  const open = running;
+  const toolSteps = (block.subBlocks ?? []).filter((b): b is ToolBlock => b.kind === "tool");
+  // Keep the card small: only the two most recent steps.
+  const recent = toolSteps.slice(-2);
+  const model = shortModelName(i.model);
+  const statusKind = awaitingApproval
+    ? "approval"
+    : running
+      ? (i.run_in_background === true ? "background" : "running")
+      : block.subStatus === "error" || block.status === "error"
+        ? "error"
+        : block.subStatus === "cancelled"
+          ? "cancelled"
+          : "done";
 
   return (
     <div className={"subagent-card" + (awaitingApproval ? " needs-approval" : "")} onClick={() => onOpen?.(block.callId)} role="button" title="Open subagent">
@@ -232,15 +248,58 @@ function SubagentCard({ block, onOpen, awaitingApproval }: { block: ToolBlock; o
         <span className="ticon"><Icon name="task" /></span>
         <span className="label">{i.description || "Subagent"}</span>
         <span className="sub-spacer" />
-        <span className="sub-steps">{running ? `${steps} steps...` : `${steps} steps`}</span>
+        <span className={"sub-status sub-status-" + statusKind}>{STATUS_LABELS[statusKind]}</span>
+        {model ? <span className="sub-chip sub-model" title={String(i.model)}>{model}</span> : null}
+        <span className="sub-chip sub-steps">{steps} {steps === 1 ? "step" : "steps"}</span>
         <span className="badge badge-agent">{isReadonlySubagent(i) ? "Explore" : "Agent"}</span>
         {awaitingApproval ? <span className="badge badge-ask">Approve</span> : null}
-        {running ? <span className="spinner" /> : <StatusIcon status={block.subStatus === "error" ? "error" : "completed"} />}
+        {running ? <RunningStop callId={block.callId} /> : <StatusIcon status={block.subStatus === "error" ? "error" : "completed"} />}
         <Icon name="chevR" size={14} className="sub-open-chev" />
       </div>
-      {subtitle && <div className="subagent-card-subtitle">{subtitle}</div>}
+      {subtitle && !open ? <div className="subagent-card-subtitle">{subtitle}</div> : null}
+      {open && (
+        <div className="subagent-steps">
+          {recent.length === 0 ? (
+            <div className="subagent-step muted">{subtitle || (running ? "Starting…" : "No steps")}</div>
+          ) : (
+            recent.map((s) => {
+              const m = toolMeta(s.name, s.input || {});
+              return (
+                <div key={s.callId} className={"subagent-step " + s.status}>
+                  <span className="step-icon"><Icon name={m.icon} size={11} /></span>
+                  <span className="step-label" title={m.label}>{m.label || s.name}</span>
+                  <StatusIcon status={s.status} callId={s.callId} />
+                </div>
+              );
+            })
+          )}
+          {recent.length > 0 && subtitle ? (
+            <div className="subagent-step activity">
+              <span className="step-icon"><span className="spinner" /></span>
+              <span className="step-label" title={subtitle}>{subtitle}</span>
+            </div>
+          ) : null}
+        </div>
+      )}
     </div>
   );
+}
+
+const STATUS_LABELS: Record<string, string> = {
+  approval: "Needs approval",
+  running: "Running",
+  background: "In background",
+  error: "Failed",
+  cancelled: "Stopped",
+  done: "Completed",
+};
+
+/** Compact model label: drop provider scope and any trailing version noise. */
+function shortModelName(model: unknown): string {
+  const raw = typeof model === "string" ? model.trim() : "";
+  if (!raw) return "";
+  const tail = raw.split("/").pop() || raw;
+  return tail.length > 24 ? tail.slice(0, 23) + "…" : tail;
 }
 
 // Human-readable "what is the subagent doing right now" line, derived from the
@@ -283,12 +342,12 @@ function PlanCard({ block, onImplement }: { block: ToolBlock; onImplement?: (pat
   const content: string = i.content || "";
   // The write_plan result is "wrote plan to .plans/<file>.md".
   const planPath = (block.result || "").replace(/^wrote plan to\s+/, "").trim() || undefined;
-  const [open, setOpen] = React.useState(true);
+  const [open, toggleOpen] = useLiveDisclosure(block.status === "running");
   const done = block.status === "completed";
 
   return (
     <div className="plan-card">
-      <div className="plan-header" onClick={() => setOpen((o) => !o)}>
+      <div className="plan-header" onClick={toggleOpen}>
         <span className={"tchev" + (open ? " open" : "")}>
           <Icon name="chevD" />
         </span>
@@ -298,7 +357,7 @@ function PlanCard({ block, onImplement }: { block: ToolBlock; onImplement?: (pat
         <span className="plan-title">{title}</span>
         <TimeoutBadge block={block} />
         <span className="badge badge-plan">Plan</span>
-        <StatusIcon status={block.status} />
+        <StatusIcon status={block.status} callId={block.callId} />
       </div>
       {open && (
         <div className="plan-body">
@@ -325,9 +384,54 @@ function PlanCard({ block, onImplement }: { block: ToolBlock; onImplement?: (pat
   );
 }
 
-function StatusIcon({ status }: { status: ToolBlock["status"] }) {
-  if (status === "running") return <span className="spinner" />;
+/**
+ * Disclosure that follows the work: expanded while the block is live, collapsed
+ * once it settles. A manual toggle wins until the block's live state changes
+ * again, so the user is never fighting the automatic behaviour.
+ */
+export function useLiveDisclosure(live: boolean): [boolean, () => void] {
+  const [open, setOpen] = React.useState(live);
+  const manual = React.useRef(false);
+  const prevLive = React.useRef(live);
+  React.useEffect(() => {
+    if (prevLive.current === live) return;
+    prevLive.current = live;
+    manual.current = false;
+    setOpen(live);
+  }, [live]);
+  const toggle = React.useCallback(() => {
+    manual.current = true;
+    setOpen((o) => !o);
+  }, []);
+  return [open, toggle];
+}
+
+function StatusIcon({ status, callId }: { status: ToolBlock["status"]; callId?: string }) {
+  if (status === "running") return <RunningStop callId={callId} />;
   return status === "completed" ? <Icon name="check" className="ok-icon" /> : <Icon name="close" className="err-icon" />;
+}
+
+/**
+ * Spinner that turns into a kill button on hover. The host registers an abort
+ * for every in-flight tool and subagent under its call id, so one message
+ * terminates any kind of running work.
+ */
+export function RunningStop({ callId }: { callId?: string }) {
+  if (!callId) return <span className="spinner" />;
+  return (
+    <span
+      className="spinner-stop"
+      role="button"
+      title="Stop this task"
+      onClick={(e) => {
+        e.stopPropagation();
+        post({ type: "cancelSubagent", callId, reason: "user" });
+      }}
+    >
+      <span className="spinner" />
+      <Icon name="close" className="stop-icon" size={11} />
+    </span>
+  );
 }
 
 /** True while this tool/task should show a live timeout countdown. */
@@ -339,13 +443,9 @@ export function isToolCountdownActive(block: ToolBlock): boolean {
   return block.status === "running";
 }
 
-/** Dedup kill-at-zero across multiple countdown mounts (explore head + card). */
-const firedTimeouts = new Set<string>();
-
 /**
- * Live countdown for a running tool/task. At 0: cancel/kill via host.
- * Uses host `startedAt` when present; otherwise starts the clock on first
- * observation so every timed tool always shows a countdown.
+ * Live display of the extension host's timeout deadline. The host exclusively
+ * owns cancellation so webview timer throttling cannot race tool completion.
  */
 export function useToolCountdown(block: ToolBlock): number | null {
   const budget = block.timeoutMs && block.timeoutMs > 0 ? block.timeoutMs : 0;
@@ -363,20 +463,11 @@ export function useToolCountdown(block: ToolBlock): number | null {
     // Prefer host clock; fall back to first UI observation of this run.
     if (hostStarted) localStart.current = hostStarted;
     else if (!localStart.current) localStart.current = Date.now();
-    // Allow re-fire only on a brand-new callId (set already cleared on settle).
-    if (block.status !== "running" && !(block.name === "Task" || block.name === "task")) {
-      firedTimeouts.delete(block.callId);
-    }
-
     const tick = () => {
       const start = hostStarted || localStart.current;
       if (!start) return;
       const sec = Math.max(0, Math.ceil((start + budget - Date.now()) / 1000));
       setLeft(sec);
-      if (sec <= 0 && !firedTimeouts.has(block.callId)) {
-        firedTimeouts.add(block.callId);
-        post({ type: "cancelSubagent", callId: block.callId, reason: "timeout" });
-      }
     };
     tick();
     const id = window.setInterval(tick, 250);
@@ -396,7 +487,7 @@ function formatCountdown(sec: number): string {
   return `${sec}s`;
 }
 
-/** Visible countdown badge; also drives kill-at-zero via useToolCountdown. */
+/** Visible countdown badge for the host-owned deadline. */
 export function TimeoutBadge({ block }: { block: ToolBlock }) {
   const left = useToolCountdown(block);
   if (left == null) return null;
@@ -404,14 +495,14 @@ export function TimeoutBadge({ block }: { block: ToolBlock }) {
   return (
     <span
       className={"tool-timeout" + (urgent ? " urgent" : "") + (left === 0 ? " zero" : "")}
-      title="Timeout remaining — tool is killed at 0"
+      title="Timeout remaining — enforced by the extension host"
     >
       {left === 0 ? "timeout" : formatCountdown(left)}
     </span>
   );
 }
 
-/** Silent countdown (kill at 0) without rendering — for collapsed explore groups. */
+/** Silent countdown state update for collapsed explore groups. */
 export function ToolTimeoutWatch({ block }: { block: ToolBlock }) {
   useToolCountdown(block);
   return null;
@@ -476,7 +567,7 @@ export function ReadLine({ block }: { block: ToolBlock }) {
       <span className="rlines">{rangeTxt ? "L" + rangeTxt : ""}</span>
       <TimeoutBadge block={block} />
       <span className="rstatus">
-        <StatusIcon status={block.status} />
+        <StatusIcon status={block.status} callId={block.callId} />
       </span>
     </div>
   );
@@ -631,17 +722,18 @@ function ToolCardInner({ block, onImplement, onOpenSubagent, awaitingApproval }:
   const meta = toolMeta(block.name, i);
   const isEdit = block.name === "edit_file" || block.name === "StrReplace" || block.name === "Write";
   const isShell = block.name === "run_terminal" || block.name === "Shell" || block.name === "AwaitShell";
-  const [open, setOpen] = React.useState(isEdit || isShell);
+  // Expanded while the tool works, collapsed the moment it settles.
+  const [open, toggleOpen] = useLiveDisclosure(block.status === "running");
 
   const onHeaderClick = () => {
     if (isEdit) {
       post({ type: "openFile", path: i.path || "", startLine: block.startLine });
     } else {
-      setOpen((o) => !o);
+      toggleOpen();
     }
   };
-
-  const showBody = isEdit ? true : open;
+  // Edit cards always show their body — the diff has its own expander.
+  const showBody = isEdit || open;
   const shellCmd = isShell ? String(i.command || meta.label || "") : "";
   const shellParsed = isShell ? parseShellResult(block.result, shellCmd) : null;
 
@@ -679,7 +771,7 @@ function ToolCardInner({ block, onImplement, onOpenSubagent, awaitingApproval }:
           {isShell && shellCmd ? <CopyCommandButton command={shellCmd} /> : null}
           <TimeoutBadge block={block} />
           {!isEdit && <span className={"badge " + meta.cls}>{meta.badge}</span>}
-          <StatusIcon status={block.status} />
+          <StatusIcon status={block.status} callId={block.callId} />
         </div>
       </div>
       {showBody && (
@@ -690,17 +782,7 @@ function ToolCardInner({ block, onImplement, onOpenSubagent, awaitingApproval }:
             // Stream the code as the model writes it; swapped for the diff on completion.
             <pre className="tool-result streaming">{editPreview(block.name, i) || "Writing…"}</pre>
           ) : isShell && shellParsed ? (
-            <div className="shell-body">
-              {shellParsed.meta ? <div className="shell-meta">{shellParsed.meta}</div> : null}
-              <pre className="terminal-output">
-                {shellParsed.body || (block.status === "running" ? "Running…" : "")}
-              </pre>
-              {shellParsed.footer ? (
-                <div className={"shell-footer" + (shellParsed.ok === false ? " err" : shellParsed.ok ? " ok" : "")}>
-                  {shellParsed.footer}
-                </div>
-              ) : null}
-            </div>
+            <TerminalBody parsed={shellParsed} running={block.status === "running"} />
           ) : (
             <pre className="tool-result">{block.status === "running" ? "Running…" : (block.result || "").slice(0, 4000)}</pre>
           )}
@@ -716,6 +798,37 @@ function ToolCardInner({ block, onImplement, onOpenSubagent, awaitingApproval }:
 export const ToolCard = React.memo(ToolCardInner, (a, b) =>
   a.block === b.block && a.onImplement === b.onImplement && a.onOpenSubagent === b.onOpenSubagent && a.awaitingApproval === b.awaitingApproval,
 );
+
+/** Terminal pane: streams live output and sticks to the bottom while running. */
+function TerminalBody({
+  parsed,
+  running,
+}: {
+  parsed: { meta: string; body: string; footer: string; ok: boolean | null };
+  running: boolean;
+}) {
+  const ref = React.useRef<HTMLPreElement>(null);
+  React.useEffect(() => {
+    if (!running) return;
+    const el = ref.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [parsed.body, running]);
+  return (
+    <div className={"shell-body" + (running ? " live" : "")}>
+      {parsed.meta ? <div className="shell-meta">{parsed.meta}</div> : null}
+      <pre className={"terminal-output" + (running ? " streaming" : "")} ref={ref}>
+        {parsed.body || (running ? "Running…" : "")}
+        {running ? <span className="term-caret" /> : null}
+      </pre>
+      {parsed.footer ? (
+        <div className={"shell-footer" + (parsed.ok === false ? " err" : parsed.ok ? " ok" : "")}>
+          {parsed.ok === true ? <Icon name="check" size={11} /> : null}
+          <span>{parsed.footer}</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
 
 function CopyCommandButton({ command }: { command: string }) {
   const [copied, setCopied] = React.useState(false);

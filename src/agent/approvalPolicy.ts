@@ -111,6 +111,71 @@ export function subjectFor(type: ApprovalActionType, toolName: string, input: an
 }
 
 /**
+ * Split a shell command line into the individual commands it will run.
+ * `git add -A; git commit -m "x"` must be checked as two commands — otherwise a
+ * deny rule on `git commit` is bypassed by chaining it behind another command.
+ * Quoted sections are ignored so separators inside strings don't split.
+ */
+export function splitShellCommands(command: string): string[] {
+	const out: string[] = [];
+	let buf = "";
+	let quote: '"' | "'" | "`" | null = null;
+	let depth = 0;
+	const push = () => {
+		const s = buf.trim();
+		if (s) out.push(s);
+		buf = "";
+	};
+	for (let i = 0; i < command.length; i++) {
+		const c = command[i];
+		const next = command[i + 1];
+		if (quote) {
+			buf += c;
+			if (c === quote && command[i - 1] !== "\\") quote = null;
+			continue;
+		}
+		if (c === '"' || c === "'" || c === "`") {
+			quote = c;
+			buf += c;
+			continue;
+		}
+		// Sub-shells / command substitution: `$(...)`, `(...)`, `{...}`.
+		if (c === "(" || c === "{") {
+			depth++;
+			buf += c;
+			continue;
+		}
+		if (c === ")" || c === "}") {
+			depth = Math.max(0, depth - 1);
+			buf += c;
+			continue;
+		}
+		if (depth === 0) {
+			if (c === "\n" || c === ";") {
+				push();
+				continue;
+			}
+			if ((c === "&" || c === "|") && next === c) {
+				push();
+				i++;
+				continue;
+			}
+			if (c === "|") {
+				push();
+				continue;
+			}
+		}
+		buf += c;
+	}
+	push();
+	// A sub-shell body still has to be checked: unwrap one level and re-split.
+	return out.flatMap((part) => {
+		const m = /^[$@&]?\s*[({]\s*([\s\S]*?)\s*[)}]\s*$/.exec(part);
+		return m && m[1].trim() ? splitShellCommands(m[1]) : [part];
+	});
+}
+
+/**
  * Wildcard pattern match. `prefixOk` distinguishes command-like subjects
  * (shell/mcp/web: `*` = any chars, exact/prefix match) from path-like ones
  * (edits/delete: glob semantics with `*` vs `**` + basename fallback).
@@ -158,14 +223,8 @@ function looksRisky(type: ApprovalActionType, subject: string): boolean {
 
 export type ApprovalDecision = "allow" | "ask" | "deny";
 
-/** Evaluate the policy for a tool call: deny list > allow list > mode. */
-export function evaluateApproval(policy: ApprovalPolicy, toolName: string, input: any, workspaceRoot?: string): ApprovalDecision {
-	const type = actionTypeForCall(toolName, input, workspaceRoot);
-	if (!type) return "allow";
-	const r = policy[type] ?? DEFAULT_APPROVAL[type];
-	const subject = subjectFor(type, toolName, input);
-	const prefixOk = type === "shell" || type === "mcp" || type === "web";
-
+/** Decide one subject against a rule. */
+function decideSubject(r: ApprovalRule, type: ApprovalActionType, subject: string, prefixOk: boolean): ApprovalDecision {
 	if ((r.denylist ?? []).some((p) => matchPattern(p, subject, prefixOk))) return "deny";
 	if ((r.allowlist ?? []).some((p) => matchPattern(p, subject, prefixOk))) return "allow";
 
@@ -174,4 +233,43 @@ export function evaluateApproval(policy: ApprovalPolicy, toolName: string, input
 	if (mode === "deny") return "deny";
 	if (mode === "review") return looksRisky(type, subject) ? "ask" : "allow";
 	return "ask";
+}
+
+/**
+ * Every subject a call must clear. A shell command line is checked per chained
+ * command so a denied command can't ride along behind an allowed one.
+ */
+export function subjectsFor(type: ApprovalActionType, toolName: string, input: any): string[] {
+	const subject = subjectFor(type, toolName, input);
+	if (type !== "shell") return [subject];
+	const parts = splitShellCommands(subject);
+	return parts.length ? parts : [subject];
+}
+
+/**
+ * Evaluate the policy for a tool call: deny list > allow list > mode.
+ * The strictest decision across all of the call's subjects wins.
+ */
+export function evaluateApproval(policy: ApprovalPolicy, toolName: string, input: any, workspaceRoot?: string): ApprovalDecision {
+	const type = actionTypeForCall(toolName, input, workspaceRoot);
+	if (!type) return "allow";
+	const r = policy[type] ?? DEFAULT_APPROVAL[type];
+	const prefixOk = type === "shell" || type === "mcp" || type === "web";
+
+	let decision: ApprovalDecision = "allow";
+	for (const subject of subjectsFor(type, toolName, input)) {
+		const d = decideSubject(r, type, subject, prefixOk);
+		if (d === "deny") return "deny";
+		if (d === "ask") decision = "ask";
+	}
+	return decision;
+}
+
+/** The chained command that triggered a deny (for the message shown to the model). */
+export function deniedSubject(policy: ApprovalPolicy, toolName: string, input: any, workspaceRoot?: string): string | undefined {
+	const type = actionTypeForCall(toolName, input, workspaceRoot);
+	if (!type) return undefined;
+	const r = policy[type] ?? DEFAULT_APPROVAL[type];
+	const prefixOk = type === "shell" || type === "mcp" || type === "web";
+	return subjectsFor(type, toolName, input).find((s) => decideSubject(r, type, s, prefixOk) === "deny");
 }

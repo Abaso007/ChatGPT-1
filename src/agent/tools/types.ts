@@ -19,8 +19,16 @@ export interface ToolResult {
   image?: { mime: string; base64: string };
 }
 
+export interface TodoItem {
+  id: string;
+  content: string;
+  status: "pending" | "in_progress" | "completed" | "cancelled";
+}
+
 /** Per-run context so concurrent agent runs don't clobber each other's hooks. */
 export interface ToolContext {
+  /** Todo state owned by this run, never shared across conversations. */
+  todos: TodoItem[];
   runSubagent?: SubagentRunner;
   askUser?: QuestionAsker;
   /** Switch the active mode mid-run (used by the SwitchMode tool). */
@@ -31,6 +39,8 @@ export interface ToolContext {
   shellSessionKey?: string;
   /** Emit a notify_on_output match to the UI (set by the loop). */
   emitShellNotify?: (text: string) => void;
+  /** Stream partial output for a running tool call (live terminal output). */
+  emitToolProgress?: (callId: string, text: string) => void;
 }
 
 export interface Tool {

@@ -88,16 +88,16 @@ export function normalizePathInput(rel: string): string {
  * separators. Does not shell-quote — callers that inject into a shell must
  * quote the result (see shell.ts quotePath).
  */
-/** Convert workspace paths to the portable model/tool representation. */
+/** Show workspace paths relative to its root; keep outside paths absolute. */
 export function toWorkspacePath(input: string, root = getWorkspaceRoot()): string {
 	const s = normalizePathInput(input);
 	if (!s) return s;
 	const ws = path.resolve(root);
 	const resolved = path.resolve(path.isAbsolute(s) ? s : path.join(ws, s));
 	const relative = path.relative(ws, resolved);
-	if (relative === "") return "/workspace";
+	if (relative === "") return ".";
 	if (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
-		return `/workspace/${relative.split(path.sep).join("/")}`;
+		return relative;
 	}
 	return resolved;
 }

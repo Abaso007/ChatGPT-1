@@ -9,7 +9,7 @@
 
 import { streamChat, SamplingParams, ModelParams } from "./provider";
 import type { OAuthKind } from "./oauth";
-import { TOOLS, schemasForMode, toolsForMode, resetTodos, getTodos, disposeShellSession, EDIT_TOOLS, MULTITASK_TOOLS, toolTimeoutMs, withToolTimeout, type AskQuestionItem, type ToolContext } from "./tools";
+import { TOOLS, schemasForMode, toolsForMode, disposeShellSession, EDIT_TOOLS, MULTITASK_TOOLS, toolTimeoutMs, withToolTimeout, type AskQuestionItem, type ToolContext } from "./tools";
 import { actionTypeForCall } from "./approvalPolicy";
 import { getWorkspaceRoot, normalizeToolPaths } from "../context/workspaceUtils";
 import { systemPrompt } from "./prompt";
@@ -120,6 +120,13 @@ function coalesceEmit(raw: (e: AgentEvent) => void): (e: AgentEvent) => void {
 			schedule(policy.intervalMs);
 			return;
 		}
+		if (event.type === "tool-call-progress") {
+			// Latest snapshot wins; live shell output can arrive far faster than
+			// the UI can paint.
+			pending.set(`prog:${event.callId}`, event);
+			schedule(150);
+			return;
+		}
 		if (event.type === "subagent-event") {
 			const child = event.event;
 			// Coalesce nested high-freq child stream events per parent call.
@@ -160,7 +167,7 @@ function coalesceEmit(raw: (e: AgentEvent) => void): (e: AgentEvent) => void {
 }
 
 export async function runAgent(opts: RunAgentOptions): Promise<void> {
-	const { apiBaseUrl, apiKey, model, prompt, attachments, history: persistedHistory, maxTokens, maxSteps, autoContinue, contextTokens, sampling, modelParams, anthropic, oauthKind, systemPromptOverride, extraInstructions, enableFileReading, enableTerminalSuggestions, enableWorkspaceContext, approve, isSubagent, customSubagents, subagentModel, registerSubagentAbort, askUser, onAfterRun, onBeforeShell, onAfterEdit, onHook, signal, emit: rawEmit } = opts;
+	const { apiBaseUrl, apiKey, model, prompt, attachments, history: persistedHistory, maxTokens, maxSteps, autoContinue, contextTokens, sampling, modelParams, anthropic, oauthKind, systemPromptOverride, extraInstructions, enableFileReading, enableTerminalSuggestions, enableWorkspaceContext, approve, isSubagent, customSubagents, subagentModel, availableModels, registerSubagentAbort, askUser, onAfterRun, onBeforeShell, onAfterEdit, onHook, signal, emit: rawEmit } = opts;
 	// Model history is disposable and may be compacted/pruned. Persisted history
 	// remains lossless for chat display/export, including full tool output/thinking.
 	const history: Step[] = persistedHistory.map((s) => structuredClone(s));
@@ -189,10 +196,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	// Per-run tool context (avoids module globals so chats run concurrently).
 	const shellSessionKey = `run_${started}_${Math.random().toString(36).slice(2, 8)}`;
 	const toolCtx: ToolContext = {
+		todos: [],
 		askUser,
 		shellSessionKey,
 		getMode: () => mode,
 		emitShellNotify: (message) => emit({ type: "shell-notify", message }),
+		emitToolProgress: (callId, text) => emit({ type: "tool-call-progress", callId, text }),
 	};
 	toolCtx.switchMode = (next) => {
 		if (next === mode) {
@@ -204,7 +213,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		return `Switched from ${prev} mode to ${next} mode.`;
 	};
 	if (!isSubagent) {
-		resetTodos();
 		// Subagent runner for the `task` tool (top-level runs only).
 		toolCtx.runSubagent = async (subPrompt, readonly, subagentName, subSignal, callId, opts) => {
 			// resume/interrupt aren't representable in this single-shot runtime.
@@ -215,7 +223,23 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			const subReadonly = def ? def.readonly : readonly;
 			const subSystemOverride = def ? def.prompt : systemPromptOverride;
 			// Model precedence: explicit task model → per-subagent override → global subagent model → chat model.
-			const subModel = opts?.model || def?.model || subagentModel || model;
+			// Models the agent invents (or that belong to another provider) would fail
+			// against this run's endpoint, so only honour ids the provider actually offers.
+			const known = (id: string | undefined): string | undefined => {
+				if (!id) return undefined;
+				if (!availableModels?.length) return id;
+				return availableModels.some((m) => m.toLowerCase() === id.toLowerCase()) ? id : undefined;
+			};
+			const subModel = known(opts?.model) || known(def?.model) || known(subagentModel) || model;
+			// Surface the resolved model on the Task card even when the call didn't name one.
+			if (callId) {
+				emit({
+					type: "tool-call-started",
+					callId,
+					name: "Task",
+					input: { model: subModel },
+				});
+			}
 			// Attach any provided files to the subagent prompt as context.
 			if (opts?.fileAttachments?.length) {
 				subPrompt = `${subPrompt}\n\n<attached_files>\n${opts.fileAttachments.join("\n")}\n</attached_files>`;
@@ -694,7 +718,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				}
 				// Unfinished todo list → one nudge to finish or explicitly wrap up.
 				if (isAgentic() && !isSubagent && !todoNudged) {
-					const open = getTodos().filter((t) => t.status === "pending" || t.status === "in_progress");
+					const open = toolCtx.todos.filter((t) => t.status === "pending" || t.status === "in_progress");
 					if (open.length) {
 						todoNudged = true;
 						pushHistory({
@@ -715,7 +739,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				let input: any = {};
 				let badArgs = false;
 				try {
-					input = JSON.parse(call.arguments || "{}");
+					input = normalizeToolPaths(call.name, JSON.parse(call.arguments || "{}"), getWorkspaceRoot());
 				} catch {
 					// Truncated/invalid args JSON (common on very large edits). Executing
 					// with {} would call tools with missing params — fail the call instead.
@@ -725,18 +749,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				const tMs = call.name.startsWith("mcp__")
 					? toolTimeoutMs("CallMcpTool")
 					: toolTimeoutMs(call.name);
-				// Shell: countdown uses block_until_ms when shorter than tool budget.
+				// Shell foreground expiry backgrounds the command; it is not the tool's
+				// hard timeout. Keep the outer safety budget so cleanup can return smoothly.
 				let timeoutMs = tMs > 0 ? tMs : undefined;
-				if ((call.name === "Shell" || call.name === "AwaitShell") && !badArgs) {
-					const raw = typeof input?.block_until_ms === "number" ? input.block_until_ms : undefined;
-					if (raw !== undefined && raw > 0) {
-						const block = Math.min(raw, call.name === "Shell" ? 30_000 : 45_000);
-						timeoutMs = timeoutMs ? Math.min(timeoutMs, block) : block;
-					} else if (call.name === "Shell" && (raw === undefined || raw === null)) {
-						// Default foreground shell wait.
-						timeoutMs = timeoutMs ? Math.min(timeoutMs, 15_000) : 15_000;
-					}
-				}
 				// Task: no outer timeout — nested tool calls already time out individually.
 				// Announce card; startedAt set when exec actually begins.
 				emit({
@@ -771,8 +786,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			};
 
 			const exec = async (i: number) => {
-				const { call, badArgs } = parsed[i];
-				const input = normalizeToolPaths(call.name, parsed[i].input, getWorkspaceRoot());
+				const { call, input, badArgs } = parsed[i];
 				if (badArgs) {
 					results[i] = {
 						status: "error",
@@ -791,8 +805,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					}
 					// Approval policy decides silently (allow/deny) or prompts (ask/review).
 					if (approve) {
-						const ok = await approve(call.name, input, call.id);
-						if (!ok) {
+						const approval = await approve(call.name, input, call.id);
+						if (approval !== true) {
 							results[i] = { status: "error", output: `user denied ${call.name}` };
 							return;
 						}
@@ -877,9 +891,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				// target paths outside the workspace.
 				const needsApproval = actionTypeForCall(call.name, input, getWorkspaceRoot()) !== undefined;
 				if (needsApproval && approve) {
-					const ok = await approve(call.name, input, call.id);
-					if (!ok) {
-						results[i] = { status: "error", output: `user denied ${call.name}; try a different approach or ask the user` };
+					const approval = await approve(call.name, input, call.id);
+					if (approval !== true) {
+						const denied = approval && typeof approval === "object"
+							? `user denied/blocked "${approval.blockedSubject}"`
+							: `user denied ${call.name}`;
+						results[i] = { status: "error", output: `${denied}; try a different approach or ask the user` };
 						return;
 					}
 				}

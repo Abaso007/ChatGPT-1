@@ -19,7 +19,7 @@ import { effectiveContextLength, ensureLoaded, isRunning, serverUrlFor } from ".
 import * as ollama from "../agent/ollama";
 import * as oauth from "../agent/oauth";
 import { recordUsage } from "../stores/usageStore";
-import { DEFAULT_APPROVAL, evaluateApproval, actionTypeForCall, subjectFor, type ApprovalActionType, type ApprovalMode, type ApprovalPolicy } from "../agent/approvalPolicy";
+import { DEFAULT_APPROVAL, evaluateApproval, deniedSubject, actionTypeForCall, subjectFor, type ApprovalActionType, type ApprovalMode, type ApprovalPolicy } from "../agent/approvalPolicy";
 import { stripModelScope, suggestPattern } from "./sidebar/approvalSuggest";
 import type { PendingApproval, RunSession } from "./sidebar/session";
 import { runHooks, runBlockingHooks } from "../integrations/hooksRunner";
@@ -780,12 +780,17 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   }
 
   /** Ask for approval in the chat UI; resolves when the user decides (or the run aborts). */
-  private async _approveTool(convId: string, session: RunSession, toolName: string, input: any, callId?: string): Promise<boolean> {
+  private async _approveTool(convId: string, session: RunSession, toolName: string, input: any, callId?: string): Promise<boolean | { approved: false; blockedSubject: string }> {
     const decision = this._evaluatePolicy(toolName, input);
     if (decision === "allow") return true;
-    if (decision === "deny") return false;
-
     const type = actionTypeForCall(toolName, input, getWorkspaceRoot())!;
+    if (decision === "deny") {
+      // Report the chained command that actually tripped the rule, not the first
+      // one on the line (`git add -A; git commit` must name `git commit`).
+      const blocked = deniedSubject(this._approvalPolicy(), toolName, input, getWorkspaceRoot());
+      return type === "shell" ? { approved: false, blockedSubject: blocked || subjectFor(type, toolName, input) || toolName } : false;
+    }
+
     const subject = subjectFor(type, toolName, input);
     const detail =
       type === "outside"
@@ -826,11 +831,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /** The effective approval policy (user settings over safe defaults). */
+  private _approvalPolicy(): ApprovalPolicy {
+    return { ...DEFAULT_APPROVAL, ...(this.featureStore.get().approvalPolicy ?? {}) };
+  }
+
   /** Evaluate the current approval policy for a tool call. */
   private _evaluatePolicy(toolName: string, input: any): "allow" | "ask" | "deny" {
-    const features = this.featureStore.get();
-    const policy: ApprovalPolicy = { ...DEFAULT_APPROVAL, ...(features.approvalPolicy ?? {}) };
-    return evaluateApproval(policy, toolName, input, getWorkspaceRoot());
+    return evaluateApproval(this._approvalPolicy(), toolName, input, getWorkspaceRoot());
   }
 
   /** Handle the webview's decision on a pending approval (optionally updating global policy). */
@@ -915,13 +923,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const sep = modelId.indexOf("::");
     const scopedProvider = sep >= 0 ? modelId.slice(0, sep) : undefined;
     modelId = stripModelScope(modelId);
-
     // OAuth account model: route by the exact scoped account kind when present,
     // else fall back to the model→kind map (legacy / bare ids).
-    const oauthKind = (scopedProvider && (["claude-code", "codex", "antigravity"] as string[]).includes(scopedProvider)
-      ? (scopedProvider as oauth.OAuthKind)
-      : undefined) ?? this._oauthModelKind.get(modelId);
+    const oauthKind = (scopedProvider?.startsWith("__oauth__:")
+      ? (scopedProvider.slice("__oauth__:".length) as oauth.OAuthKind)
+      : scopedProvider && (["claude-code", "codex", "antigravity"] as string[]).includes(scopedProvider)
+        ? (scopedProvider as oauth.OAuthKind)
+        : undefined) ?? this._oauthModelKind.get(modelId);
     if (oauthKind) {
+
       return { baseUrl: "", apiKey: "", model: modelId, anthropic: false, providerId: oauthKind, oauthKind };
     }
     // Local llama.cpp model: served by the extension's own server, no provider
@@ -1006,6 +1016,21 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       out.push({ ...m, id: `${prov.id}::${m.id}`, modelId: m.id, options: this.featureStore.optionsFor(m.id, prov.kind), group: "default", providerId: prov.id, providerName: prov.name });
       seen.add(`${prov.id}::${m.id}`);
     }
+    // Connected OAuth providers also expose enabled catalog/custom models even
+    // when their live model endpoint omits those IDs.
+    for (const { providerId } of fetched) {
+      if (!providerId.startsWith("__oauth__:")) continue;
+      const kind = providerId.slice("__oauth__:".length) as oauth.OAuthKind;
+      const label = oauth.OAUTH_LABEL[kind];
+      const base = kind === "claude-code" ? "anthropic" : kind === "codex" ? "openai" : "google";
+      for (const m of this.featureStore.allModels()) {
+        if (m.providerId !== `oauth:${kind}` && !kindMatches(m.kind, kind)) continue;
+        const pid = `${providerId}::${m.id}`;
+        if (seen.has(pid) || disabledSet.has(m.id) || (!enabledSet.has(m.id) && !catalogIds.has(m.id))) continue;
+        out.push({ ...m, id: pid, modelId: m.id, options: this.featureStore.optionsFor(m.id, kind), group: "other", providerId, providerName: label, kind: base as ModelDef["kind"] });
+        seen.add(pid);
+      }
+    }
     // Fetched curated models per provider. Ollama models are surfaced as local
     // models in their own group (shown unless disabled), not the allowlist.
     for (const { providerId, ids } of fetched) {
@@ -1017,8 +1042,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         for (const id of ids) {
           const pid = `${providerId}::${id}`;
           if (seen.has(pid)) continue;
-          // Account models are gated by the catalog allow-list too: only curated
-          // models are on by default, the rest stay disabled until enabled.
+          // Account models are disabled by default unless explicitly enabled,
+          // except for curated catalog entries that are default-on.
           if (disabledSet.has(id) || (!enabledSet.has(id) && !catalogIds.has(id))) continue;
           // Kind-scoped lookup: prefer a def declared for this OAuth kind, then
           // the base API kind — so the same id can have per-provider names/options.
@@ -1064,6 +1089,17 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       seen.add(pid);
     }
     return out;
+  }
+
+  /**
+   * Bare model ids the given provider/OAuth account can actually serve. Used to
+   * reject subagent model slugs the agent invented or borrowed from another provider.
+   */
+  private _modelsForProvider(providerId?: string, oauthKind?: oauth.OAuthKind): string[] {
+    const list = this._buildModelList(this._fetchedCache ?? []);
+    const wanted = oauthKind ? `__oauth__:${oauthKind}` : providerId;
+    if (!wanted) return [];
+    return [...new Set(list.filter((m) => m.providerId === wanted).map((m) => m.modelId || stripModelScope(m.id)))];
   }
 
   /** Auto mode: ask the judge model to choose an enabled model for the task. */
@@ -1399,6 +1435,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         scheduleUi();
         return;
       }
+      if (ev.type === "tool-call-progress") {
+        uiPending.set(`prog:${ev.callId}`, { event, apply: true });
+        scheduleUi();
+        return;
+      }
       if (ev.type === "subagent-event") {
         const child = ev.event as SharedAgentEvent;
         if (child.type === "text-delta" || child.type === "thinking-delta" || child.type === "tool-call-args") {
@@ -1530,6 +1571,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         approve: (toolName, input, callId) => this._approveTool(convId, session, toolName, input, callId),
         customSubagents: features.subagents,
         subagentModel: features.subagentModel,
+        availableModels: this._modelsForProvider(prov.providerId, prov.oauthKind),
         registerSubagentAbort: (callId, abort) => {
           // Chain aborts (tool kill + nested Task child) so timeout fires both.
           const prev = session.subagentAborts.get(callId);

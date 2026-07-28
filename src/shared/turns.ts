@@ -18,6 +18,7 @@ export type AgentEvent =
   | { type: "thinking-delta"; text: string }
   | { type: "tool-call-started"; callId: string; name: string; input: any; timeoutMs?: number; startedAt?: number }
   | { type: "tool-call-args"; callId: string; argsText: string }
+  | { type: "tool-call-progress"; callId: string; text: string }
   | {
       type: "tool-call-completed";
       callId: string;
@@ -183,6 +184,17 @@ export function parsePartialArgs(argsText: string, prev: unknown): unknown {
   }
 }
 
+/**
+ * Merge a later tool-call-started payload over the current input. Later frames
+ * can carry extra resolved fields (e.g. the subagent's model) without dropping
+ * what the model originally streamed.
+ */
+function mergeToolInput(prev: any, next: any): any {
+  if (!next || !Object.keys(next).length) return prev;
+  if (!prev || typeof prev !== "object" || !Object.keys(prev).length) return next;
+  return { ...prev, ...next };
+}
+
 /** Index of the tool block with `callId`, searched newest-first. */
 function findToolIndex(blocks: AssistantBlock[], callId: string): number {
   for (let i = blocks.length - 1; i >= 0; i--) {
@@ -216,7 +228,7 @@ export function applyToBlocks(blocksIn: AssistantBlock[], ev: AgentEvent): Assis
       blocks[existing] = {
         ...prev,
         name: ev.name,
-        input: Object.keys(ev.input || {}).length ? ev.input : prev.input,
+        input: mergeToolInput(prev.input, ev.input),
         timeoutMs: timeoutMs ?? prev.timeoutMs,
         startedAt: startedAt ?? prev.startedAt,
       } as AssistantBlock;
@@ -238,6 +250,13 @@ export function applyToBlocks(blocksIn: AssistantBlock[], ev: AgentEvent): Assis
     const input = parsePartialArgs(ev.argsText, b.input);
     if (input === b.input) return blocksIn;
     blocks[i] = { ...b, input };
+    return blocks;
+  } else if (ev.type === "tool-call-progress") {
+    const i = findToolIndex(blocks, ev.callId);
+    if (i < 0) return blocksIn;
+    const b = blocks[i] as ToolBlock;
+    if (b.status !== "running" || b.result === ev.text) return blocksIn;
+    blocks[i] = { ...b, result: ev.text };
     return blocks;
   } else if (ev.type === "tool-call-completed") {
     const i = findToolIndex(blocks, ev.callId);
@@ -338,7 +357,7 @@ export function applyEvent(turns: Turn[], ev: AgentEvent): Turn[] {
       turn.blocks[existing] = {
         ...prev,
         name: ev.name,
-        input: Object.keys(ev.input || {}).length ? ev.input : prev.input,
+        input: mergeToolInput(prev.input, ev.input),
         status: "running",
         timeoutMs: timeoutMs ?? prev.timeoutMs,
         startedAt: startedAt ?? prev.startedAt,
@@ -367,6 +386,17 @@ export function applyEvent(turns: Turn[], ev: AgentEvent): Turn[] {
     const input = parsePartialArgs(ev.argsText, b.input);
     if (input === b.input) return turns;
     turn.blocks[i] = { ...b, input };
+    return list;
+  }
+
+  if (ev.type === "tool-call-progress") {
+    const i = lastIndexOfTool(turns, ev.callId);
+    if (i < 0) return turns;
+    const prev = (turns[turns.length - 1] as AssistantTurn).blocks[i] as ToolBlock;
+    // Never overwrite a settled result with a late progress frame.
+    if (prev.status !== "running" || prev.result === ev.text) return turns;
+    const { list, turn } = ensureAssistant(turns);
+    turn.blocks[i] = { ...prev, result: ev.text };
     return list;
   }
 

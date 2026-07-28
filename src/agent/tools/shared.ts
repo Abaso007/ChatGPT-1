@@ -40,33 +40,32 @@ export {
 export const TOOL_TIMEOUT_MS: Record<string, number> = {
   // Outer safety net: slightly above each tool's own cap so the tool can
   // clean up (kill process / mark done) before the loop aborts it.
-  Shell: 45_000,
-  AwaitShell: 60_000,
-  Grep: 20_000,
-  Glob: 20_000,
-  FileSearch: 15_000,
-  SemanticSearch: 30_000,
-  SearchDocs: 25_000,
-  ListDir: 10_000,
-  // Inner Read has 3s stat + 12s I/O; outer net must be slightly above.
-  Read: 15_000,
-  ReadLints: 15_000,
-  WebSearch: 20_000,
-  WebFetch: 25_000,
-  StrReplace: 20_000,
-  Write: 20_000,
-  Delete: 10_000,
-  EditNotebook: 20_000,
-  CallMcpTool: 45_000,
-  FetchMcpResource: 30_000,
-  ListMcpResources: 15_000,
-  TodoWrite: 15_000,
-  TodoRead: 15_000,
-  WritePlan: 10_000,
-  SwitchMode: 5_000,
+  Shell: 120_000,
+  AwaitShell: 300_000,
+  Grep: 120_000,
+  Glob: 120_000,
+  FileSearch: 120_000,
+  SemanticSearch: 300_000,
+  SearchDocs: 300_000,
+  ListDir: 60_000,
+  Read: 300_000,
+  ReadLints: 300_000,
+  WebSearch: 300_000,
+  WebFetch: 300_000,
+  StrReplace: 300_000,
+  Write: 300_000,
+  Delete: 60_000,
+  EditNotebook: 300_000,
+  CallMcpTool: 180_000,
+  FetchMcpResource: 120_000,
+  ListMcpResources: 120_000,
+  TodoWrite: 120_000,
+  TodoRead: 120_000,
+  WritePlan: 300_000,
+  SwitchMode: 60_000,
 };
 /** Default when a tool has no explicit entry. */
-export const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
+export const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
 /** Tools that manage their own lifetime. Task has no outer budget — nested tools already time out. */
 export const NO_TOOL_TIMEOUT = new Set(["AskQuestion", "Task"]);
 
@@ -369,17 +368,30 @@ export interface ShellNotify {
   emit?: (text: string) => void;
 }
 
+/** Lifecycle state of a shell command (drives the footer the model/UI reads). */
+export type ShellStatus = "running" | "completed" | "failed" | "aborted" | "timeout" | "backgrounded";
+
 export interface BgShell {
   id: string;
   command: string;
-  proc: ChildProcess;
+  /** The child shell running this command (unset until spawned). */
+  proc?: ChildProcess;
   output: string;
   done: boolean;
   exitCode: number | null;
   startedAt: number;
+  /** Wall-clock end (set once the command settles). */
+  endedAt?: number;
+  /** Directory the command ran in. */
+  cwd?: string;
+  status: ShellStatus;
+  /** Signal that killed the underlying process, when known. */
+  signal?: string;
   notify?: ShellNotify;
   /** Pull any new session output into this shell's buffer (for polling). */
   pump?: () => void;
+  /** Live-output sink (streams the rendered card to the UI while running). */
+  onChunk?: (chunk: string) => void;
 }
 
 export const bgShells = new Map<string, BgShell>();
@@ -394,6 +406,7 @@ export function nextShellId(): string {
  */
 export function pushShellOutput(sh: BgShell, chunk: string): void {
   sh.output += chunk;
+  try { sh.onChunk?.(chunk); } catch { /* ignore */ }
   const n = sh.notify;
   if (!n || !n.emit) return;
   if (!n.re.test(chunk)) return;
@@ -407,79 +420,95 @@ export function pushShellOutput(sh: BgShell, chunk: string): void {
 // Persistent stateful shell sessions (cwd/env persist across commands per run)
 // ---------------------------------------------------------------------------
 
+/**
+ * A run's shell state. Each command runs in its own child shell (so it always
+ * exits with a real exit code and never leaves the agent waiting on a live
+ * REPL); only the working directory is carried across calls.
+ */
 export interface ShellSession {
-  proc: ChildProcess;
-  /** Serializes command execution so output framing stays intact. */
+  /** Directory the next command runs in (updated by `cd`). */
+  cwd: string;
+  /** Serializes command execution within a run. */
   queue: Promise<unknown>;
-  buffer: string;
+  /** Commands still running for this run (killed on dispose). */
+  running: Set<ChildProcess>;
 }
 
+const IS_WIN = process.platform === "win32";
 const shellSessions = new Map<string, ShellSession>();
 
-function spawnSessionShell(cwd: string): ChildProcess {
-  if (process.platform === "win32") {
-    // -File - reads stdin as a script; NonInteractive avoids prompts that hang.
-    return spawn(
-      "powershell.exe",
-      ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "-"],
-      { cwd, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] },
-    );
-  }
-  // Non-interactive bash (no -i): interactive mode can hang on job control / PS1.
-  return spawn("bash", ["--noprofile", "--norc"], {
-    cwd,
-    stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, TERM: "dumb", PS1: "", PS2: "" },
-  });
-}
-
-/** Get (or lazily create) the persistent shell session for a run key. */
+/** Get (or lazily create) the shell state for a run key. */
 export function getShellSession(key: string, cwd: string): ShellSession {
   let s = shellSessions.get(key);
-  if (s && !s.proc.killed && s.proc.exitCode === null && s.proc.stdin && !s.proc.stdin.destroyed) {
-    return s;
+  if (!s) {
+    s = { cwd, queue: Promise.resolve(), running: new Set() };
+    shellSessions.set(key, s);
   }
-  if (s) {
-    try { s.proc.kill(); } catch { /* ignore */ }
-    shellSessions.delete(key);
-  }
-  const proc = spawnSessionShell(cwd);
-  s = { proc, queue: Promise.resolve(), buffer: "" };
-  proc.stdout?.on("data", (d) => {
-    try { s!.buffer += d.toString(); } catch { /* ignore */ }
-  });
-  proc.stderr?.on("data", (d) => {
-    try { s!.buffer += d.toString(); } catch { /* ignore */ }
-  });
-  proc.on("error", (error) => {
-    s!.buffer += `\n(shell process error: ${error.message})`;
-  });
-  proc.on("exit", (code, signal) => {
-    if (code !== 0 || signal) {
-      s!.buffer += `\n(shell process exited${code == null ? "" : ` with code ${code}`}${signal ? ` from signal ${signal}` : ""})`;
-    }
-  });
-  // Prevent unhandled 'error' on stdin from crashing the extension host.
-  proc.stdin?.on("error", () => { /* ignore broken pipe */ });
-  shellSessions.set(key, s);
   return s;
 }
 
-/** Tear down a run's persistent shell session (call on run end / dispose). */
-export function disposeShellSession(key: string): void {
-  const s = shellSessions.get(key);
-  if (s) {
-    try {
-      if (process.platform === "win32") s.proc.kill();
-      else s.proc.kill("SIGKILL");
-    } catch { /* ignore */ }
-    shellSessions.delete(key);
-  }
+/**
+ * Spawn one command in its own shell. The command is passed through verbatim —
+ * no wrapper script, no marker protocol — so its own exit code is the process
+ * exit code and the shell terminates the moment the command does.
+ */
+export function spawnShellCommand(command: string, cwd: string): ChildProcess {
+  const proc = IS_WIN
+    ? spawn(
+        "powershell.exe",
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+        { cwd, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] },
+      )
+    : spawn("bash", ["--noprofile", "--norc", "-c", command], {
+        cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, TERM: "dumb", PS1: "", PS2: "" },
+      });
+  // Nothing will ever type at this shell: close stdin so anything that prompts
+  // reads EOF and exits instead of hanging forever.
+  try {
+    proc.stdin?.on("error", () => { /* ignore broken pipe */ });
+    proc.stdin?.end();
+  } catch { /* ignore */ }
+  return proc;
 }
 
-/** Detach a busy session so later commands get a fresh shell while it finishes. */
-export function detachShellSession(key: string, session: ShellSession): void {
-  if (shellSessions.get(key) === session) shellSessions.delete(key);
+/** Kill a command and everything it spawned (npm/pnpm scripts spawn children). */
+export function killShellProcess(proc: ChildProcess): void {
+  if (!proc || proc.exitCode != null || proc.signalCode) return;
+  try {
+    if (IS_WIN && proc.pid) {
+      const killer = spawn("taskkill", ["/pid", String(proc.pid), "/T", "/F"], { windowsHide: true });
+      killer.on("error", () => { try { proc.kill(); } catch { /* ignore */ } });
+    } else if (proc.pid) {
+      // Negative pid targets the process group when detached; fall back to the pid.
+      try { process.kill(-proc.pid, "SIGKILL"); } catch { proc.kill("SIGKILL"); }
+    } else {
+      proc.kill();
+    }
+  } catch { /* ignore */ }
+}
+
+/**
+ * Carry `cd` across calls without keeping a live shell: a command that is only
+ * a directory change updates the session cwd for subsequent commands.
+ */
+export function applyCwdSideEffect(session: ShellSession, command: string): void {
+  const m = /^\s*cd\s+(?:\/d\s+)?("([^"]+)"|'([^']+)'|[^\s&|;]+)\s*$/i.exec(command);
+  if (!m) return;
+  const target = (m[2] ?? m[3] ?? m[1]).trim();
+  if (!target || target === "-") return;
+  const next = path.isAbsolute(target) ? target : path.resolve(session.cwd, target);
+  session.cwd = next;
+}
+
+/** Tear down a run's shell state, killing anything still running. */
+export function disposeShellSession(key: string): void {
+  const s = shellSessions.get(key);
+  if (!s) return;
+  for (const proc of s.running) killShellProcess(proc);
+  s.running.clear();
+  shellSessions.delete(key);
 }
 
 /**
@@ -497,13 +526,7 @@ export function waitForShell(sh: BgShell, ms: number, pattern?: RegExp, signal?:
       signal?.removeEventListener("abort", onAbort);
       resolve();
     };
-    const onAbort = () => {
-      if (!sh.done) {
-        sh.output += "\n(aborted)";
-        sh.done = true;
-      }
-      finish();
-    };
+    const onAbort = () => finish();
     if (signal?.aborted) {
       onAbort();
       return;
@@ -557,41 +580,41 @@ function collapseRepeats(s: string): string {
   return out.join("\n");
 }
 
+/** Human-readable label for a settled shell status. */
+function statusLabel(sh: BgShell): string {
+  switch (sh.status) {
+    case "completed":
+      return "success";
+    case "failed":
+      return "failed";
+    case "aborted":
+      return "aborted";
+    case "timeout":
+      return "timed out";
+    case "backgrounded":
+      return "backgrounded";
+    default:
+      return "running";
+  }
+}
+
 export function renderShell(sh: BgShell): string {
-  const elapsed = Date.now() - sh.startedAt;
+  const elapsed = (sh.endedAt ?? Date.now()) - sh.startedAt;
   // Trim trailing blank lines the shell echoes; collapse >2 blank lines and
   // runs of identical lines (progress spinners, repeated warnings).
-  const cleaned = collapseRepeats(sh.output.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trimEnd());
+  const cleaned = collapseRepeats(
+    sh.output.replace(/\r(?!\n)/g, "\n").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trimEnd(),
+  );
   const body = clampMiddle(cleaned, 12000);
   if (sh.done) {
-    // Completed: the model only needs output + exit code. Drop pid/running_for_ms.
-    const status = sh.exitCode === 0 ? "" : ` (exit ${sh.exitCode})`;
-    return `${body || "(no output)"}\n[done${status} in ${elapsed}ms]`;
+    const code = sh.exitCode ?? 0;
+    const sig = sh.signal ? ` signal=${sh.signal}` : "";
+    // Footer keeps a machine-readable exit_code (the UI colors the card from it).
+    return `${body || "(no output)"}\n(exit_code=${code}${sig} ${statusLabel(sh)} in ${elapsed}ms)`;
   }
   // Still running: keep the poll hint + id so the model can await it.
-  const head = `[shell ${sh.id}] running_for_ms=${elapsed}`;
+  const head = `[shell ${sh.id}] running_for_ms=${elapsed}${sh.cwd ? ` cwd=${sh.cwd}` : ""}`;
   return `${head}\n${body}\n(still running - poll with AwaitShell shell_id="${sh.id}")`;
-}
-
-// ---------------------------------------------------------------------------
-// In-memory per-run todo list (TodoWrite / TodoRead)
-// ---------------------------------------------------------------------------
-
-export interface TodoItem {
-  id: string;
-  content: string;
-  status: "pending" | "in_progress" | "completed" | "cancelled";
-}
-
-let TODO_LIST: TodoItem[] = [];
-export function resetTodos(): void {
-  TODO_LIST = [];
-}
-export function getTodos(): TodoItem[] {
-  return TODO_LIST;
-}
-export function setTodos(list: TodoItem[]): void {
-  TODO_LIST = list;
 }
 
 // ---------------------------------------------------------------------------

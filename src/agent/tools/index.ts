@@ -21,8 +21,6 @@ import { callMcpToolTool, fetchMcpResourceTool, listMcpResourcesTool } from "./m
 export * from "./types";
 export { TOOL_SPECS, type ToolSpec } from "./schemas";
 export {
-  resetTodos,
-  getTodos,
   setSubagentRunner,
   setQuestionAsker,
   disposeShellSession,
@@ -30,7 +28,6 @@ export {
   withToolTimeout,
   setToolTimeoutOverrides,
   DEFAULT_TOOL_TIMEOUTS_SEC,
-  type TodoItem,
 } from "./shared";
 
 // All tools. Names/descriptions/schemas come from schemas.ts via defineTool,
