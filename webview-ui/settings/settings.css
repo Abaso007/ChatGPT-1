@@ -254,10 +254,43 @@ select:focus { outline: none; border-color: var(--vscode-focusBorder); }
 .fc-inline-row { display: flex; gap: 8px; align-items: stretch; }
 .fc-inline-row input { flex: 1; }
 .fc-inline-row .btn-ghost { white-space: nowrap; }
-.team-members { display: flex; flex-wrap: wrap; gap: 6px 10px; }
-.team-member { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--fg-dim); white-space: nowrap; cursor: pointer; padding: 3px 8px; border: 1px solid var(--vscode-panel-border, rgba(255,255,255,.1)); border-radius: 12px; }
-.team-member:hover { background: var(--hover); }
-.team-member input { width: auto; margin: 0; accent-color: var(--accent, var(--vscode-focusBorder)); }
+/* ---- Config tables (subagents, teams) ---- */
+.cfg-table { width: 100%; border-collapse: collapse; margin: 4px 0 8px; font-size: 12.5px; table-layout: fixed; }
+.cfg-table th { text-align: left; font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .4px; color: var(--fg-faint, var(--fg-dim)); padding: 6px 10px; border-bottom: 1px solid var(--border-soft); white-space: nowrap; }
+.cfg-table td { padding: 9px 10px; border-bottom: 1px solid var(--border-soft); vertical-align: middle; overflow: hidden; text-overflow: ellipsis; }
+.cfg-table tbody tr:hover { background: var(--hover); }
+.cfg-table .c-name { font-weight: 600; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cfg-table .c-desc { color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cfg-table .c-mode { width: 96px; }
+.cfg-table .c-model { width: 120px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cfg-table .c-check { width: 42px; text-align: center; }
+.cfg-table .c-check input { width: auto; margin: 0; accent-color: var(--accent, var(--vscode-focusBorder)); }
+.cfg-table .c-count { width: 52px; text-align: center; color: var(--fg-dim); }
+.cfg-table .c-actions { width: 108px; white-space: nowrap; text-align: right; }
+.cfg-table .c-actions > * { vertical-align: middle; }
+.cfg-table .c-actions .icon-btn { margin-left: 2px; }
+.cfg-sub { font-weight: 400; font-size: 11.5px; color: var(--fg-dim); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---- Add/edit dialogs ---- */
+.modal.modal-lg { width: min(640px, 94vw); }
+.modal.modal-sm { width: min(420px, 92vw); }
+.fc-help { font-size: 11px; font-weight: 400; color: var(--fg-dim); line-height: 1.45; }
+.fc-help code { font-family: var(--vscode-editor-font-family, monospace); font-size: 10.5px; }
+.fc-mono { font-family: var(--vscode-editor-font-family, monospace); font-size: 11.5px; line-height: 1.5; resize: vertical; }
+.fc-field-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.fc-field-actions { display: flex; gap: 4px; }
+.member-picker { display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow-y: auto; border: 1px solid var(--border-soft); border-radius: 8px; padding: 6px; }
+.member-option { display: flex; align-items: flex-start; gap: 8px; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+.member-option:hover { background: var(--hover); }
+.member-option.on { background: var(--vscode-list-inactiveSelectionBackground, rgba(255,255,255,.05)); }
+.member-option input { width: auto; margin: 2px 0 0; flex: 0 0 auto; accent-color: var(--accent, var(--vscode-focusBorder)); }
+.mo-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.mo-name { display: flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; color: var(--fg); }
+.mo-desc { font-size: 11.5px; color: var(--fg-dim); line-height: 1.4; }
+.confirm-text { margin: 0; font-size: 13px; line-height: 1.55; color: var(--fg); }
+.confirm-detail { margin: 0; font-size: 12px; line-height: 1.5; color: var(--fg-dim); }
+.btn-danger { display: inline-flex; align-items: center; gap: 6px; background: var(--error, #e06c75); color: #fff; border: 1px solid transparent; cursor: pointer; padding: 6px 14px; border-radius: 6px; font-size: 12.5px; font-weight: 600; }
+.btn-danger:hover { filter: brightness(1.08); }
 .fc-error { font-size: 11.5px; color: var(--error); }
 /* Standalone errors rendered at panel level (outside a card body). */
 .content-inner > .fc-error { margin: 4px 0 12px; }
