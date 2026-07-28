@@ -13,8 +13,18 @@ import { TOOLS, schemasForMode, toolsForMode, disposeShellSession, EDIT_TOOLS, M
 import { actionTypeForCall } from "./approvalPolicy";
 import { getWorkspaceRoot, normalizeToolPaths } from "../context/workspaceUtils";
 import { systemPrompt } from "./prompt";
-import { buildMessages, fitStepsToBudget, splitForCompaction, stepsToTranscript, stepsTokens, type CursorContextBlocks } from "./messages";
-import { economizeHistory, COMPACT_AT_FILL, COMPACT_SOFT_FILL, COMPACT_KEEP_FRAC, isCompactionBoundary } from "./contextEconomy";
+import { buildMessages, clip, fitStepsToBudget, splitForCompaction, stepsToTranscript, stepsTokens, type CursorContextBlocks } from "./messages";
+import {
+	economizeHistory,
+	COMPACT_AT_FILL,
+	COMPACT_SOFT_FILL,
+	COMPACT_KEEP_FRAC,
+	COMPACT_MIN_GAIN_FRAC,
+	COMPACT_COOLDOWN_STEPS,
+	currentRequestText,
+	isCompactionBoundary,
+} from "./contextEconomy";
+import { ActivityLedger } from "./taskState";
 import { buildUserInfoBlock, buildOpenFilesBlock } from "../context/cursorContext";
 import { mcpManager } from "../integrations/mcpClient";
 import type { AgentEvent, Attachment, Mode, Step, ToolCall, ToolSchema } from "./types";
@@ -47,6 +57,35 @@ const PROJECT_REMINDER =
 	'(run_in_background=true, subagent_type set to the member name), launching every independent member AT THE SAME TIME in a single turn.\n</reminder>';
 
 const MAX_STEPS = 50;
+
+/**
+ * Don't rewrite history for token economy until the window is this full.
+ * Pruning invalidates the provider prompt cache from the first rewritten message
+ * onward, so doing it early costs more than it saves — and full fidelity is the
+ * best memory there is while the context still has room.
+ */
+const ECONOMIZE_AT_FILL = 0.5;
+
+/**
+ * Tools whose description carries protocol the model must not lose mid-run
+ * (delegation rules, background-subagent etiquette, edit contracts). Everything
+ * else is compacted to its first sentence — but for the WHOLE run, so the tool
+ * block stays byte-identical and cacheable instead of changing after step 0.
+ */
+const VERBOSE_TOOL_DESCRIPTIONS = new Set([
+	"Task",
+	"Shell",
+	"AwaitShell",
+	"TodoWrite",
+	"WritePlan",
+	"AskQuestion",
+	"SwitchMode",
+	"StrReplace",
+	"Write",
+	"Delete",
+	"EditNotebook",
+	"Read",
+]);
 
 /**
  * Batch text/thinking/tool-args deltas so streaming cannot flood the host
@@ -184,6 +223,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		persistedHistory.push(...steps.map((s) => structuredClone(s)));
 	};
 	const emit = coalesceEmit(rawEmit);
+	/** Loop-injected note. Marked synthetic so it never poses as the user's request. */
+	const pushSystemNote = (text: string) => pushHistory({ kind: "user", text, synthetic: true });
 	// Mutable so the SwitchMode tool can change it mid-run.
 	let mode = opts.mode;
 	// multitask/project are agentic (full tool access); treat them like agent for gating.
@@ -374,6 +415,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			// context is best-effort
 		}
 	}
+	// Subagents get no workspace blocks, but they still carry the durable ledger —
+	// keep the container so the live message shape never flips mid-run (a flip is
+	// a prompt-cache miss).
+	if (!cursorCtx) cursorCtx = { userInfo: "", openFiles: "" };
 
 	// MCP tools available across connected servers.
 	const mcpTools = isSubagent ? [] : mcpManager.listTools();
@@ -405,6 +450,48 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		// Prevent unbounded recursion of subagents.
 		disabledToolNames.add("Task");
 	}
+
+	/**
+	 * Tool block for a mode, built once and reused byte-for-byte for the rest of
+	 * the run: the schemas sit in front of the messages in the cached prefix, so
+	 * changing a description mid-run (as this used to do after step 0) throws away
+	 * the whole prompt cache and quietly drops usage rules the model still needs.
+	 */
+	const schemaCache = new Map<Mode, ToolSchema[]>();
+	const schemasFor = (m: Mode): ToolSchema[] => {
+		const hit = schemaCache.get(m);
+		if (hit) return hit;
+		const compact = (s: ToolSchema): ToolSchema => {
+			if (VERBOSE_TOOL_DESCRIPTIONS.has(s.function.name) || s.function.description.length <= 240) return s;
+			const first = s.function.description.split(/\n|(?<=[.!?])\s/)[0]?.trim();
+			return {
+				...s,
+				function: { ...s.function, description: (first || `Use ${s.function.name} when needed.`).slice(0, 240) },
+			};
+		};
+		const built = [
+			...schemasForMode(m).filter((s) => !disabledToolNames.has(s.function.name)).map(compact),
+			...mcpSchemas.map(compact),
+		];
+		schemaCache.set(m, built);
+		return built;
+	};
+	/** Tokens the tool block costs on every request (part of the fill estimate). */
+	const toolSchemaTokens = () => {
+		const m = mode;
+		let n = toolTokenCache.get(m);
+		if (n === undefined) {
+			n = Math.ceil(JSON.stringify(schemasFor(m)).length / 4);
+			toolTokenCache.set(m, n);
+		}
+		return n;
+	};
+	const toolTokenCache = new Map<Mode, number>();
+
+	/** Durable, prune-proof record of everything this run did. */
+	const ledger = new ActivityLedger();
+	/** Step index of the last compaction, for the cooldown. */
+	let lastCompactionStep = -Infinity;
 
 	// Tools the current mode is permitted to invoke (ask/plan = read-only,
 	// plan additionally gets write_plan, agent gets everything).
@@ -447,10 +534,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				bgReported++;
 			}
 			if (done.length) {
-				pushHistory({
-					kind: "user",
-					text: `[System: Background subagent${done.length > 1 ? "s" : ""} finished — results below.]\n\n${done.map((v) => `### ${v.title}\n${v.text}`).join("\n\n")}`,
-				});
+				pushSystemNote(
+					`Background subagent${done.length > 1 ? "s" : ""} finished — results below.\n\n${done.map((v) => `### ${v.title}\n${v.text}`).join("\n\n")}`,
+				);
 			}
 			return done.length;
 		};
@@ -505,27 +591,40 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			return true;
 		};
 
-		// Summarize older steps with the same model (non-streaming aggregate) so
-		// compaction keeps task intent, decisions, file paths and unfinished work.
+		// Summarize older steps (non-streaming aggregate) so compaction keeps task
+		// intent, decisions, file paths and unfinished work. Summaries compound:
+		// each one is handed the previous summary so nothing is summarized twice.
+		let lastSummary = "";
 		const summarizeSteps = async (steps: Step[]): Promise<string> => {
 			const sys =
 				"You compress an agent coding session transcript. Write a dense summary that preserves: " +
-				"1) the user's original request(s) and intent, " +
+				"1) the user's original request(s) and intent, verbatim where short, " +
 				"2) files created/edited/deleted with paths and short change notes (e.g. +12 -5), not full code, " +
 				"3) the latest todo list / task status if present, " +
 				"4) key assistant conclusions and decisions (not chain-of-thought), " +
-				"5) subagent/task outcomes, 6) errors hit and fixes, 7) unfinished work / next steps. " +
-				"Use short markdown sections. Do not invent details. Do not paste large file bodies.";
+				"5) subagent/task outcomes, 6) errors hit and how they were fixed (keep exact error text where short), " +
+				"7) unfinished work / next steps, 8) constraints and preferences the user stated. " +
+				"Use short markdown sections. Do not invent details. Do not paste large file bodies. " +
+				"When an earlier summary is provided, extend it into one merged summary rather than re-summarizing it.";
+			const transcript = clip(stepsToTranscript(steps), 320_000);
+			const body = lastSummary
+				? `## Earlier summary (already compressed — carry it forward)\n${lastSummary}\n\n## New transcript to merge in\n${transcript}`
+				: transcript;
+			// A cheap model is plenty for compression; fall back to the run's model.
+			const summaryModel =
+				subagentModel && (!availableModels?.length || availableModels.some((m) => m.toLowerCase() === subagentModel.toLowerCase()))
+					? subagentModel
+					: model;
 			let text = "";
 			for await (const ev of streamChat({
 				apiBaseUrl,
 				apiKey,
-				model,
+				model: summaryModel,
 				messages: [
 					{ role: "system", content: sys },
-					{ role: "user", content: stepsToTranscript(steps).slice(0, 400_000) },
+					{ role: "user", content: body },
 				],
-				maxTokens: 2048,
+				maxTokens: 3072,
 				anthropic,
 				oauthKind,
 				signal,
@@ -534,7 +633,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				if (ev.type === "text-delta") text += ev.text;
 			}
 			if (!text.trim()) throw new Error("empty summary");
-			return text.trim();
+			lastSummary = text.trim();
+			return lastSummary;
 		};
 
 		const stepLimit = maxSteps && maxSteps > 0 ? maxSteps : MAX_STEPS;
@@ -557,33 +657,48 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			const budget = contextTokens && contextTokens > 0
 				? Math.max(1024, contextTokens - (maxTokens ?? 4096) - 1024)
 				: 0;
-			// 0) Cheap in-place economy every step: stub stale tool dumps + slim old
-			// edit args. Free wins (no LLM call). UI cards keep full results via turns.
-			economizeHistory(history);
+			// Tool schemas ride along on every request and are large; leaving them
+			// out of the estimate made the guard optimistic by 10k+ tokens.
+			const overheadTokens = Math.ceil(system.length / 4) + toolSchemaTokens();
+			// 0) Cheap in-place economy: stub stale tool dumps + slim old edit args.
+			// Free (no LLM call) but it rewrites already-sent messages, which costs a
+			// prompt-cache miss — so only start once the window is actually filling up.
+			// Recent work always stays verbatim, and the durable ledger keeps the rest.
+			const keepRecentTokens = budget > 0 ? Math.max(4_000, Math.floor(budget * 0.25)) : 12_000;
+			const rawFill = stepsTokens(history) + overheadTokens;
+			if (budget <= 0 || rawFill >= budget * ECONOMIZE_AT_FILL) {
+				economizeHistory(history, { keepRecentTokens });
+			}
 			// 1) Auto-summarization: soft boundary from 65% fill; hard at 78%.
-			// Live-turn tool results stay verbatim (see economizeHistory) so the
-			// agent cannot amnesically re-do the same edits/reads mid-task.
-			const usedEst = stepsTokens(history) + Math.ceil(system.length / 4);
+			const usedEst = stepsTokens(history) + overheadTokens;
 			const fill = Math.max(usedEst, lastPrompt);
-			const shouldCompact = budget > 0 && (
+			const cooledDown = step - lastCompactionStep >= COMPACT_COOLDOWN_STEPS;
+			const shouldCompact = budget > 0 && cooledDown && (
 				fill >= budget * COMPACT_AT_FILL ||
 				(fill >= budget * COMPACT_SOFT_FILL && isCompactionBoundary(history))
 			);
 			if (shouldCompact) {
 				const { prefix, tail } = splitForCompaction(history, Math.floor(budget * COMPACT_KEEP_FRAC));
-				if (prefix.length >= 2) {
+				// Only worth an extra model call if it frees real room.
+				const gain = stepsTokens(prefix);
+				if (prefix.length >= 2 && gain >= budget * COMPACT_MIN_GAIN_FRAC) {
 					onHook?.("preCompact", { dropped: String(prefix.length), reason: "auto-summarize" });
 					emit({ type: "compaction", status: "running" });
 					try {
 						const summary = await summarizeSteps(prefix);
 						history.length = 0;
 						history.push(
-							{ kind: "user", text: `[System: Earlier conversation was summarized to free context. Summary:]\n\n${summary}` },
+							{
+								kind: "user",
+								synthetic: true,
+								text: `Earlier conversation was summarized to free context. This summary replaces it — treat it as fact.\n\n${summary}`,
+							},
 							{ kind: "assistant", text: "Understood. Continuing with the summarized context.", calls: [] },
 							...tail,
 						);
+						lastCompactionStep = step;
 						// Re-economize the new tail (summary is dense; keep it).
-						economizeHistory(history);
+						economizeHistory(history, { keepRecentTokens });
 						emit({ type: "compaction", status: "done", summary });
 					} catch {
 						emit({ type: "compaction", status: "failed" });
@@ -596,9 +711,27 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			if (fitted !== history && fitted.length < history.length) {
 				onHook?.("preCompact", { dropped: String(history.length - fitted.length) });
 			}
-			const liveCtx = cursorCtx
-				? { ...cursorCtx, reminder: mode === "multitask" ? MULTITASK_REMINDER : mode === "project" ? PROJECT_REMINDER : undefined, timestamp: runTimestamp }
-				: cursorCtx;
+			// The open-files block goes stale over a long run, but rebuilding it every
+			// step would churn the cached prefix for nothing — refresh periodically and
+			// only adopt it when it actually changed.
+			if (cursorCtx && !isSubagent && enableWorkspaceContext !== false && step > 0 && step % 6 === 0) {
+				try {
+					const fresh = await buildOpenFilesBlock();
+					if (fresh !== cursorCtx.openFiles) cursorCtx = { ...cursorCtx, openFiles: fresh };
+				} catch { /* context is best-effort */ }
+			}
+			// Durable run record: what happened and how each card ended, never file
+			// bodies. Rebuilt every step from state that pruning cannot touch, so the
+			// agent keeps its memory of the run at a flat token cost.
+			const taskState = ledger.isEmpty
+				? undefined
+				: ledger.render({ request: currentRequestText(history), todos: toolCtx.todos });
+			const liveCtx: CursorContextBlocks = {
+				...cursorCtx,
+				reminder: mode === "multitask" ? MULTITASK_REMINDER : mode === "project" ? PROJECT_REMINDER : undefined,
+				timestamp: runTimestamp,
+				taskState,
+			};
 			const messages = buildMessages(system, fitted, liveCtx);
 			let assistantText = "";
 			let thinking = "";
@@ -609,24 +742,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			const callIdByIndex = new Map<number, string>();
 			const argsByIndex = new Map<number, string>();
 
-			// Tool definitions are paid on every step. Keep every tool callable, but
-			// replace long instructional descriptions after the first turn; parameter
-			// schemas retain the exact calling contract.
-			const compactSchema = (s: ToolSchema): ToolSchema => {
-				if (step === 0 || s.function.description.length <= 240) return s;
-				const first = s.function.description.split(/\n|(?<=[.!?])\s/)[0]?.trim();
-				return {
-					...s,
-					function: {
-						...s.function,
-						description: (first || `Use ${s.function.name} when needed.`).slice(0, 240),
-					},
-				};
-			};
-			const activeTools = [
-				...schemasForMode(mode).filter((s) => !disabledToolNames.has(s.function.name)).map(compactSchema),
-				...mcpSchemas.map(compactSchema),
-			];
+			const activeTools = schemasFor(mode);
 
 			// Stream response from LLM
 			for await (const ev of streamChat({
@@ -681,8 +797,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				}
 			}
 
+			// One assistant message per model turn (text + its tool calls together):
+			// splitting it doubled the message count and deviated from the shape
+			// providers expect for thinking followed by tool use.
 			if (assistantText || thinking || !calls.length) {
-				pushHistory({ kind: "assistant", text: assistantText, thinking: thinking || undefined, calls: [] });
+				pushHistory({ kind: "assistant", text: assistantText, thinking: thinking || undefined, calls });
+			} else if (calls.length) {
+				pushHistory({ kind: "assistant", text: "", calls });
 			}
 
 			if (!calls.length) {
@@ -690,10 +811,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				// calling write_plan, force it once.
 				if (mode === "plan" && !planWritten && !planNudged) {
 					planNudged = true;
-					pushHistory({
-						kind: "user",
-						text: "[System: You are in PLAN MODE and have not written the plan yet. Call the WritePlan tool now with a title and the complete Markdown plan. Do not respond with the plan as plain text — it must be saved via WritePlan.]",
-					});
+					pushSystemNote(
+						"You are in PLAN MODE and have not written the plan yet. Call the WritePlan tool now with a title and the complete Markdown plan. Do not respond with the plan as plain text — it must be saved via WritePlan.",
+					);
 					continue;
 				}
 				// In-flight background Task subagents: wait + feed results before any
@@ -710,29 +830,26 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				// Truncated response (hit max output tokens): the model didn't choose to
 				// stop — never treat this as a final answer. Ask it to continue.
 				if (isAgentic() && /length|max_tokens|max_output_tokens/i.test(finishReason)) {
-					pushHistory({
-						kind: "user",
-						text: "[System: Your previous response was cut off because it hit the output-token limit. Continue exactly where you left off; re-issue any tool call that was truncated.]",
-					});
+					pushSystemNote(
+						"Your previous response was cut off because it hit the output-token limit. Continue exactly where you left off; re-issue any tool call that was truncated.",
+					);
 					continue;
 				}
 				// Thinking-only turn (reasoned but produced no answer and no tool calls):
 				// the task isn't done — nudge it to act instead of silently stopping.
 				if (isAgentic() && !assistantText.trim() && thinking.trim()) {
-					pushHistory({
-						kind: "user",
-						text: "[System: You produced only internal reasoning with no answer or tool calls. Continue working on the task now — make the necessary tool calls, or reply with your final answer if fully finished.]",
-					});
+					pushSystemNote(
+						"You produced only internal reasoning with no answer or tool calls. Continue working on the task now — make the necessary tool calls, or reply with your final answer if fully finished.",
+					);
 					continue;
 				}
 				const prev = history[history.length - 2];
 				// Empty turn right after a tool result → nudge for more work. If it
 				// produced any text, that's its final answer — stop.
 				if (isAgentic() && !assistantText.trim() && !thinking.trim() && prev && prev.kind === "tool-result") {
-					pushHistory({
-						kind: "user",
-						text: "[System: If you need to make more tool calls to complete the task, please do so now. If you are fully finished, reply normally without calling any tools.]",
-					});
+					pushSystemNote(
+						"If you need to make more tool calls to complete the task, please do so now. If you are fully finished, reply normally without calling any tools.",
+					);
 					continue;
 				}
 				// Unfinished todo list → one nudge to finish or explicitly wrap up.
@@ -740,19 +857,15 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					const open = toolCtx.todos.filter((t) => t.status === "pending" || t.status === "in_progress");
 					if (open.length) {
 						todoNudged = true;
-						pushHistory({
-							kind: "user",
-							text: `[System: Your todo list still has ${open.length} unfinished item${open.length > 1 ? "s" : ""}: ${open.map((t) => `"${t.content}"`).join(", ")}. Continue working on them now. If they are actually done or no longer needed, update the todo list, then give your final answer.]`,
-						});
+						pushSystemNote(
+							`Your todo list still has ${open.length} unfinished item${open.length > 1 ? "s" : ""}: ${open.map((t) => `"${t.content}"`).join(", ")}. Continue working on them now. If they are actually done or no longer needed, update the todo list, then give your final answer.`,
+						);
 						continue;
 					}
 				}
 				finalText = assistantText;
 				break;
 			}
-
-			// Add a separate step for the tool calls so they are separated in history
-			pushHistory({ kind: "assistant", text: "", calls: calls });
 
 			const parsed = calls.map((call) => {
 				let input: any = {};
@@ -1068,7 +1181,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				if (call.name === "WritePlan" && r.status === "completed") {
 					planWritten = true;
 				}
-				// Live-turn results stay full; economizeHistory stubs older dumps only.
+				// Record the card's outcome in the durable ledger before the result can
+				// ever be pruned out of history.
+				ledger.record(call.name, parsed[i].input, r.status, r.output);
+				// Recent results stay full; economizeHistory stubs older dumps only.
 				pushHistory({ kind: "tool-result", callId: call.id, name: call.name, output: r.output, status: r.status, image: r.image });
 			}
 			// After launching background Task(s), wait for that wave before calling the

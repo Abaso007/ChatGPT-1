@@ -30,7 +30,10 @@ export interface ToolImage {
 }
 
 export type Step =
-  | { kind: "user"; text: string; attachments?: Attachment[] }
+  /** `synthetic` marks loop-injected system messages (nudges, subagent reports,
+   *  compaction summaries) — they are not the user's request and must never be
+   *  treated as one when placing context blocks or bounding the live turn. */
+  | { kind: "user"; text: string; attachments?: Attachment[]; synthetic?: boolean }
   | { kind: "assistant"; text: string; thinking?: string; calls: ToolCall[] }
   | { kind: "tool-result"; callId: string; name: string; output: string; status: "completed" | "error"; image?: ToolImage };
 

@@ -20,7 +20,7 @@ import type { Step, ToolCall } from "./types";
  * verbatim so mid-task work is not forgotten.
  */
 
-/** Exploration / dump tools — full body rarely needed after the live turn. */
+/** Exploration / dump tools — full body rarely needed once out of the recent window. */
 const STALEABLE = new Set([
   "Read",
   "Grep",
@@ -38,6 +38,18 @@ const STALEABLE = new Set([
   "FetchMcpResource",
   "CallMcpTool",
 ]);
+
+/**
+ * Tools whose output is *evidence*, not a dump: build/test/lint results are the
+ * reason the agent is doing what it's doing, and a bare "re-call if needed" stub
+ * both loses the failure and provokes an expensive re-run. Keep a short tail
+ * instead — far cheaper than re-running the command.
+ */
+const TAIL_KEEP = new Set(["Shell", "AwaitShell", "ReadLints"]);
+
+/** Lines / chars retained when tail-keeping a result. */
+const TAIL_LINES = 24;
+const TAIL_CHARS = 1600;
 
 /** Durable task state — never stub results (already short or must stay visible). */
 const PROTECTED_RESULTS = new Set([
@@ -66,6 +78,12 @@ const KEEP_RECENT_CALL_BATCHES = 4;
 
 /** Only prune dump results larger than this (chars). */
 const MIN_PRUNE_CHARS = 400;
+
+/** Default verbatim recent-work window (tokens) when no budget is supplied. */
+const DEFAULT_KEEP_RECENT_TOKENS = 12_000;
+
+/** The over-budget pass keeps a much smaller verbatim window. */
+const HARD_KEEP_RECENT_TOKENS = 4_000;
 
 function isPruned(s: string): boolean {
   return s.startsWith(PRUNE_MARK);
@@ -111,6 +129,74 @@ function stubDumpResult(name: string, output: string, status: string, argsHint?:
       ? ` · ${(output.split(/\r?\n/)[0] || "").slice(0, 160)}`
       : "";
   return `${PRUNE_MARK} ${name}${where ? ` · ${where}` : ""} · ${lines} lines · ${n} chars · ${status}.${err} Re-call if needed.`;
+}
+
+/** Keep the tail of an evidence result (errors, test/build output) plus a header. */
+function tailResult(name: string, output: string, status: string, argsHint?: string): string {
+  const lines = output.split(/\r?\n/);
+  let tail = lines.slice(-TAIL_LINES).join("\n");
+  if (tail.length > TAIL_CHARS) tail = tail.slice(-TAIL_CHARS);
+  const omitted = Math.max(0, lines.length - TAIL_LINES);
+  const head = `${PRUNE_MARK} ${name}${argsHint ? ` · ${argsHint.slice(0, 120)}` : ""} · ${status} · last ${Math.min(TAIL_LINES, lines.length)} of ${lines.length} lines${omitted ? ` (${omitted} earlier omitted)` : ""}:`;
+  return `${head}\n${tail}`;
+}
+
+/** Rough token estimate (~4 chars/token) for one step, images priced realistically. */
+export function stepTokens(s: Step): number {
+  let chars = 0;
+  if (s.kind === "user") {
+    chars += s.text.length;
+    for (const a of s.attachments || []) chars += a.kind === "image" ? 0 : a.data?.length || 0;
+    const imgs = (s.attachments || []).filter((a) => a.kind === "image").length;
+    return Math.ceil(chars / 4) + imgs * IMAGE_TOKENS + 4;
+  }
+  if (s.kind === "assistant") {
+    // thinking is UI-only — never sent on the wire (see buildMessages).
+    chars += s.text?.length || 0;
+    for (const c of s.calls || []) chars += (c.arguments?.length || 0) + (c.name?.length || 0) + 8;
+    return Math.ceil(chars / 4) + 4;
+  }
+  chars += s.output?.length || 0;
+  return Math.ceil(chars / 4) + (s.image ? IMAGE_TOKENS : 0) + 4;
+}
+
+/** Total rough token estimate for a step list. */
+export function stepsTokens(steps: Step[]): number {
+  return steps.reduce((n, s) => n + stepTokens(s), 0);
+}
+
+/** A rendered image costs far more than its base64 length suggests. */
+const IMAGE_TOKENS = 1300;
+
+/** Index of the last real (non-synthetic) user message — the actual request. */
+export function lastRealUserIndex(steps: Step[]): number {
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const s = steps[i];
+    if (s.kind === "user" && !s.synthetic) return i;
+  }
+  return lastUserIndex(steps);
+}
+
+/** The user's current request text, used to anchor the durable state block. */
+export function currentRequestText(steps: Step[]): string {
+  const i = lastRealUserIndex(steps);
+  const s = steps[i];
+  return s && s.kind === "user" ? s.text : "";
+}
+
+/**
+ * Start of the verbatim "recent work" window: walk back from the end until
+ * `keepTokens` is used. Everything before it may be pruned, including work from
+ * the current user turn — a long agentic run is one turn, so bounding the window
+ * by the last user message (as this used to) meant never pruning at all.
+ */
+export function recentWindowStart(steps: Step[], keepTokens: number): number {
+  let used = 0;
+  for (let i = steps.length - 1; i >= 0; i--) {
+    used += stepTokens(steps[i]);
+    if (used > keepTokens) return i + 1;
+  }
+  return 0;
 }
 
 /** Compact edit tool args: path + line stats, no code bodies. */
@@ -254,7 +340,17 @@ function dedupeRepeatedResults(steps: Step[], liveFrom: number): number {
     const k = keyByCallId.get(s.callId);
     if (!k || lastIdxByKey.get(k) === i) continue;
     if (isPruned(s.output) || s.output.length < 120) continue;
-    steps[i] = { ...s, output: `${PRUNE_MARK} superseded by a newer ${s.name} of the same target — use the latest result.` };
+    // Errors are evidence: a failed read/command that a later call repeated is
+    // exactly the thing the agent is reacting to, so keep its tail.
+    if (s.status === "error") {
+      steps[i] = { ...s, output: tailResult(s.name, s.output, s.status, k.slice(k.indexOf(":") + 1)) };
+      deduped++;
+      continue;
+    }
+    steps[i] = {
+      ...s,
+      output: `${PRUNE_MARK} ${s.name} · ${k.slice(k.indexOf(":") + 1).slice(0, 120)} · superseded by a newer ${s.name} of the same target below — use that result.`,
+    };
     deduped++;
   }
   return deduped;
@@ -272,12 +368,17 @@ function isStaleableResult(name: string): boolean {
   return STALEABLE.has(name) || name.startsWith("mcp__");
 }
 
+/** Evidence results keep a tail instead of collapsing to a one-line stub. */
+function keepsTail(name: string, status: string): boolean {
+  return TAIL_KEEP.has(name) || status === "error";
+}
+
 /**
  * In-place history shrink for the model wire.
  * Never mutates the live turn (last user message onward).
  * Never drops assistant text, todos, edits, or task results — only dump bodies.
  */
-export function economizeHistory(steps: Step[]): { prunedResults: number; slimmedCalls: number } {
+export function economizeHistory(steps: Step[], opts?: { keepRecentTokens?: number }): { prunedResults: number; slimmedCalls: number } {
   let prunedResults = 0;
   let slimmedCalls = 0;
   if (steps.length < 4) {
@@ -289,10 +390,13 @@ export function economizeHistory(steps: Step[]): { prunedResults: number; slimme
     return { prunedResults, slimmedCalls };
   }
 
-  const liveFrom = lastUserIndex(steps);
+  // The live window is the recent work, never "everything since the last user
+  // message": loop-injected nudges used to move that boundary and instantly
+  // collapse the work the agent was in the middle of.
+  const liveFrom = recentWindowStart(steps, opts?.keepRecentTokens ?? DEFAULT_KEEP_RECENT_TOKENS);
   const argsByCall = callArgsById(steps);
 
-  // 0) Latest-wins dedup only on pre-live history.
+  // 0) Latest-wins dedup only outside the recent window.
   prunedResults += dedupeRepeatedResults(steps, liveFrom);
 
   // 1) Stub dump tool bodies from older turns. Keep a small recent dump window.
@@ -319,7 +423,9 @@ export function economizeHistory(steps: Step[]): { prunedResults: number; slimme
     }
     steps[i] = {
       ...s,
-      output: stubDumpResult(s.name, s.output, s.status, pathHint),
+      output: keepsTail(s.name, s.status)
+        ? tailResult(s.name, s.output, s.status, pathHint)
+        : stubDumpResult(s.name, s.output, s.status, pathHint),
     };
     prunedResults++;
   }
@@ -372,8 +478,8 @@ export function economizeHistory(steps: Step[]): { prunedResults: number; slimme
  * Extra pass when still over budget: stub ALL pre-live dump results (no recent
  * window), then slim ALL pre-live edit args. Does not drop steps or assistant text.
  */
-export function economizeHistoryHard(steps: Step[]): void {
-  const liveFrom = lastUserIndex(steps);
+export function economizeHistoryHard(steps: Step[], opts?: { keepRecentTokens?: number }): void {
+  const liveFrom = recentWindowStart(steps, opts?.keepRecentTokens ?? HARD_KEEP_RECENT_TOKENS);
   const argsByCall = callArgsById(steps);
   for (let i = 0; i < liveFrom; i++) {
     const s = steps[i];
@@ -384,7 +490,12 @@ export function economizeHistoryHard(steps: Step[]): void {
       } catch {
         /* ignore */
       }
-      steps[i] = { ...s, output: stubDumpResult(s.name, s.output, s.status, pathHint) };
+      steps[i] = {
+        ...s,
+        output: keepsTail(s.name, s.status)
+          ? tailResult(s.name, s.output, s.status, pathHint)
+          : stubDumpResult(s.name, s.output, s.status, pathHint),
+      };
     }
     if (s.kind === "assistant" && s.calls?.length) {
       let changed = false;
@@ -419,14 +530,26 @@ export const COMPACT_AT_FILL = 0.78;
 /** Soft boundary trigger — wait longer so mid-task work isn't summarized away. */
 export const COMPACT_SOFT_FILL = 0.65;
 
-/** After summarize, keep this fraction of budget as verbatim tail. */
-export const COMPACT_KEEP_FRAC = 0.5;
+/**
+ * After summarize, keep this fraction of budget as verbatim tail. Kept well under
+ * the soft trigger so a compaction actually buys room — at 0.5 the very next step
+ * was back at the threshold and re-summarized on every turn.
+ */
+export const COMPACT_KEEP_FRAC = 0.35;
+
+/** Skip compaction unless the summarized prefix frees at least this much budget. */
+export const COMPACT_MIN_GAIN_FRAC = 0.12;
+
+/** Minimum steps between two compactions, so a run can't summarize in a loop. */
+export const COMPACT_COOLDOWN_STEPS = 6;
 
 /** Safe boundary: the model just completed a subtask instead of being mid-tool loop. */
 export function isCompactionBoundary(steps: Step[]): boolean {
   const last = steps[steps.length - 1];
   if (!last) return false;
   if (last.kind === "assistant" && !!last.text.trim() && !last.calls.length) return true;
-  if (last.kind === "user") return /^\[System: Background subagent/.test(last.text);
+  // Loop-injected messages (subagent reports, nudges) land between turns, which
+  // is exactly a safe place to compact.
+  if (last.kind === "user") return last.synthetic === true;
   return false;
 }
