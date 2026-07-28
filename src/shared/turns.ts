@@ -11,7 +11,7 @@
 // host (authoritative state, runs in the background) and the webview (pure
 // renderer). Keep this DOM/React-free so it can run in the host.
 
-export type Mode = "agent" | "ask" | "plan" | "multitask" | "debug";
+export type Mode = "agent" | "ask" | "plan" | "multitask" | "project" | "debug";
 
 export type AgentEvent =
   | { type: "text-delta"; text: string }

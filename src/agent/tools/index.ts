@@ -78,7 +78,8 @@ export function toolsForMode(mode: Mode): Tool[] {
   return Object.entries(TOOLS)
     .filter(([name, t]) => {
       if (PLAN_ONLY.has(name)) return mode === "plan";
-      if (mode === "multitask") return MULTITASK_TOOLS.has(name);
+      // Project mode is a team lead: same coordinator restrictions as multitask.
+      if (mode === "multitask" || mode === "project") return MULTITASK_TOOLS.has(name);
       // ask + plan are read-only: no mutating tools. agent/debug: everything.
       return mode === "agent" || mode === "debug" ? true : !t.mutating;
     })

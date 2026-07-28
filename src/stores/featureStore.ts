@@ -13,6 +13,9 @@ import type { Persona } from "../agent/personas";
 import type { LlamacppModel, LlamacppServerConfig } from "../agent/llamacpp";
 import { DEFAULT_APPROVAL, type ApprovalPolicy } from "../agent/approvalPolicy";
 import type { DocSource } from "../agent/docsIndex";
+import { type TeamDef, withBuiltinTeamSubagents, withBuiltinTeams } from "../agent/teams";
+
+export type { TeamDef };
 
 export interface SubagentDef {
 	id: string;
@@ -208,6 +211,10 @@ export interface FeatureConfig {
 	customModels: ModelDef[];
 	mcpServers: McpServerConfig[];
 	subagents: SubagentDef[];
+	/** Named groups of subagents selectable in Project mode. */
+	teams: TeamDef[];
+	/** Teams selected for the current Project-mode run. */
+	activeTeamIds: string[];
 	/** Default model for subagents launched via the task tool ("" = inherit chat model). */
 	subagentModel: string;
 	/** Judge model used by Auto mode to pick a model for each task ("" = first enabled). */
@@ -274,6 +281,8 @@ const DEFAULTS: FeatureConfig = {
 	customModels: [],
 	mcpServers: [],
 	subagents: [],
+	teams: [],
+	activeTeamIds: ["team-full-stack"],
 	subagentModel: "",
 	autoJudgeModel: "",
 	embedModel: "minilm",
@@ -327,7 +336,11 @@ export class FeatureStore {
 
 	get(): FeatureConfig {
 		const stored = this.context.globalState.get<Partial<FeatureConfig>>(KEY) ?? {};
-		return { ...DEFAULTS, ...stored };
+		const cfg = { ...DEFAULTS, ...stored };
+		// Built-in team members/teams are always available, even for configs saved before they shipped.
+		cfg.subagents = withBuiltinTeamSubagents(cfg.subagents ?? []);
+		cfg.teams = withBuiltinTeams(cfg.teams ?? []);
+		return cfg;
 	}
 
 	async set(patch: Partial<FeatureConfig>): Promise<FeatureConfig> {

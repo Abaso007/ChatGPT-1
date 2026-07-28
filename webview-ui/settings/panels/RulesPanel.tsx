@@ -11,7 +11,7 @@ import * as React from "react";
 import { Icon } from "../../shared/icons";
 import { vscode } from "../../shared/vscode";
 import { ModelSelect } from "../../shared/ModelSelect";
-import { FeatureConfig, ModelDef, RuleInfo, SkillInfo, SubagentDef, uid } from "../features";
+import { FeatureConfig, ModelDef, RuleInfo, SkillInfo, SubagentDef, TeamDef, uid } from "../features";
 
 export function RulesPanel({
   features,
@@ -43,9 +43,31 @@ export function RulesPanel({
       ],
     });
 
+  const teams = features.teams ?? [];
+  const updateTeam = (i: number, patch: Partial<TeamDef>) =>
+    setFeatures({ teams: teams.map((t, idx) => (idx === i ? { ...t, ...patch } : t)) });
+  const removeTeam = (i: number) => {
+    const removed = teams[i];
+    setFeatures({
+      teams: teams.filter((_, idx) => idx !== i),
+      activeTeamIds: (features.activeTeamIds ?? []).filter((id) => id !== removed?.id),
+    });
+  };
+  const addTeam = () =>
+    setFeatures({ teams: [...teams, { id: uid("team"), name: "New Team", description: "", subagentIds: [] }] });
+  const cloneTeam = (i: number) => {
+    const t = teams[i];
+    setFeatures({ teams: [...teams, { ...t, id: uid("team"), name: `${t.name} (copy)`, builtin: false }] });
+  };
+  const toggleMember = (i: number, subId: string) => {
+    const t = teams[i];
+    const has = t.subagentIds.includes(subId);
+    updateTeam(i, { subagentIds: has ? t.subagentIds.filter((x) => x !== subId) : [...t.subagentIds, subId] });
+  };
+
   return (
     <>
-      <h1 className="page-title" style={{ marginBottom: 4 }}>Rules, Skills, Subagents</h1>
+      <h1 className="page-title" style={{ marginBottom: 4 }}>Rules, Skills, Subagents, Teams</h1>
       <p className="panel-hint" style={{ marginBottom: 24 }}>Provide domain-specific knowledge and workflows for the agent</p>
 
       <div className="rss-section-head">
@@ -185,6 +207,69 @@ export function RulesPanel({
             </div>
           </div>
         ))
+      )}
+
+      <div className="rss-section-head" style={{ marginTop: 28 }}>
+        <span className="rss-title">Teams <span className="rss-help" title="A team is a group of subagents. In Project mode you assign one or more teams and the agent becomes their project lead.">?</span></span>
+        <button className="btn-ghost sm" onClick={addTeam}>
+          <Icon name="plus" size={12} /> New
+        </button>
+      </div>
+      <p className="panel-hint">Group subagents into teams, then pick the team(s) that should work on a task in Project mode. Built-in teams cover a full development squad.</p>
+      {teams.length === 0 ? (
+        <div className="rss-empty">
+          <div className="rss-empty-title">No Teams Yet</div>
+          <div className="rss-empty-sub">Group subagents into a squad you can assign in Project mode</div>
+          <button className="btn-secondary" onClick={addTeam}>New Team</button>
+        </div>
+      ) : (
+        teams.map((team, i) => {
+          const active = (features.activeTeamIds ?? []).includes(team.id);
+          return (
+            <div className="feature-card" key={team.id}>
+              <div className="fc-head">
+                <input className="fc-title-input" value={team.name} onChange={(e) => updateTeam(i, { name: e.target.value })} placeholder="Team name" />
+                <label className="fc-inline" title="Assign this team to Project mode runs">
+                  <input
+                    type="checkbox"
+                    checked={active}
+                    onChange={(e) => {
+                      const ids = features.activeTeamIds ?? [];
+                      setFeatures({ activeTeamIds: e.target.checked ? [...ids, team.id] : ids.filter((id) => id !== team.id) });
+                    }}
+                  /> assigned
+                </label>
+                <button className="icon-btn" onClick={() => cloneTeam(i)} title="Duplicate team">
+                  <Icon name="copy" size={14} />
+                </button>
+                {!team.builtin && (
+                  <button className="icon-btn" onClick={() => removeTeam(i)} title="Remove">
+                    <Icon name="trash" size={14} />
+                  </button>
+                )}
+              </div>
+              <div className="fc-body">
+                <label className="fc-field">
+                  <span>Description</span>
+                  <input value={team.description} onChange={(e) => updateTeam(i, { description: e.target.value })} placeholder="What this team is for" />
+                </label>
+                <div className="fc-field">
+                  <span>Members ({team.subagentIds.length})</span>
+                  <div className="team-members">
+                    {features.subagents.length === 0 && <div className="row-desc">Create subagents above to staff this team.</div>}
+                    {features.subagents.map((sub) => (
+                      <label className="team-member" key={sub.id} title={sub.description}>
+                        <input type="checkbox" checked={team.subagentIds.includes(sub.id)} onChange={() => toggleMember(i, sub.id)} />
+                        <span>{sub.name}</span>
+                        {sub.readonly && <span className="badge-tag glob">read-only</span>}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })
       )}
     </>
   );

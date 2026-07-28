@@ -254,6 +254,10 @@ select:focus { outline: none; border-color: var(--vscode-focusBorder); }
 .fc-inline-row { display: flex; gap: 8px; align-items: stretch; }
 .fc-inline-row input { flex: 1; }
 .fc-inline-row .btn-ghost { white-space: nowrap; }
+.team-members { display: flex; flex-wrap: wrap; gap: 6px 10px; }
+.team-member { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--fg-dim); white-space: nowrap; cursor: pointer; padding: 3px 8px; border: 1px solid var(--vscode-panel-border, rgba(255,255,255,.1)); border-radius: 12px; }
+.team-member:hover { background: var(--hover); }
+.team-member input { width: auto; margin: 0; accent-color: var(--accent, var(--vscode-focusBorder)); }
 .fc-error { font-size: 11.5px; color: var(--error); }
 /* Standalone errors rendered at panel level (outside a card body). */
 .content-inner > .fc-error { margin: 4px 0 12px; }

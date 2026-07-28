@@ -7,7 +7,7 @@
  * Licensed under the MIT License. See LICENSE file in the project root.
  */
 
-export type Mode = "agent" | "ask" | "plan" | "multitask" | "debug";
+export type Mode = "agent" | "ask" | "plan" | "multitask" | "project" | "debug";
 
 export interface ToolCall {
   id: string;

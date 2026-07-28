@@ -108,8 +108,9 @@ export const taskTool = defineTool("Task", false, async (input, abortSignal, cal
 // ---- SwitchMode ----
 export const switchModeTool = defineTool("SwitchMode", false, async (input, _signal, _callId, ctx) => {
   const target = String(input?.target_mode_id ?? "").trim().toLowerCase();
-  if (target !== "plan" && target !== "agent" && target !== "multitask" && target !== "debug") {
-    return { output: "error: target_mode_id must be 'plan', 'agent', 'multitask', or 'debug'" };
+  const allowed = ["plan", "agent", "multitask", "project", "debug"];
+  if (!allowed.includes(target)) {
+    return { output: `error: target_mode_id must be one of ${allowed.map((m) => `'${m}'`).join(", ")}` };
   }
   if (!ctx?.switchMode) return { output: "error: mode switching is not available in this run" };
   return { output: ctx.switchMode(target as Mode) };

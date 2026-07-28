@@ -399,11 +399,12 @@ export const fileSearchTool = defineTool("FileSearch", false, async (input, abor
 // In multitask mode the agent is a COORDINATOR: it must NOT edit anything itself.
 // Edit tools refuse and instruct it to delegate to parallel subagents instead.
 const MULTITASK_BLOCK: ToolResult = {
-	output: "error: editing is disabled in multitask mode — you are a COORDINATOR and must NOT edit files yourself. " + "Delegate ALL implementation work to subagents: call the Task tool (run_in_background=true) for each " + "independent unit of work and launch multiple subagents AT THE SAME TIME in a single turn. " + "Have the subagents make these edits in parallel; do not call edit tools directly.",
+	output: "error: editing is disabled in coordinator modes (multitask/project) — you are a COORDINATOR and must NOT edit files yourself. " + "Delegate ALL implementation work to subagents: call the Task tool (run_in_background=true) for each " + "independent unit of work and launch multiple subagents AT THE SAME TIME in a single turn. " + "Have the subagents make these edits in parallel; do not call edit tools directly.",
 };
 
 function blockedInMultitask(ctx?: ToolContext): boolean {
-	return ctx?.getMode?.() === "multitask";
+	const m = ctx?.getMode?.();
+	return m === "multitask" || m === "project";
 }
 
 const editExecute: Tool["execute"] = async (input, _signal, _callId, ctx) => {

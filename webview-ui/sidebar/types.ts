@@ -94,9 +94,11 @@ export interface PendingChangeInfo {
 
 // Extension -> webview
 export type UiPrefs = { chatTextSize: string; submitWithCtrlEnter: boolean; maxTabCount: number; completionSound: boolean };
+/** A subagent team as shown in the composer's Project-mode picker. */
+export type TeamInfo = { id: string; name: string; description: string; members: string[] };
 export type InMessage =
-  | { type: "initialState"; mode: Mode; selectedModel: string; activeId?: string; turns: Turn[]; personas: PersonaInfo[]; activePersonaId: string; hasProviders: boolean; runningConvIds?: string[]; uiPrefs?: UiPrefs; usedTokens?: number }
-  | { type: "configState"; personas: PersonaInfo[]; activePersonaId: string; hasProviders: boolean; uiPrefs?: UiPrefs }
+  | { type: "initialState"; mode: Mode; selectedModel: string; activeId?: string; turns: Turn[]; personas: PersonaInfo[]; activePersonaId: string; hasProviders: boolean; teams?: TeamInfo[]; activeTeamIds?: string[]; runningConvIds?: string[]; uiPrefs?: UiPrefs; usedTokens?: number }
+  | { type: "configState"; personas: PersonaInfo[]; activePersonaId: string; hasProviders: boolean; teams?: TeamInfo[]; activeTeamIds?: string[]; uiPrefs?: UiPrefs }
   | { type: "modelsFetched"; models: string[]; modelList?: ModelDef[] }
   | { type: "modelSelected"; model: string }
   | { type: "conversations"; list: ConversationSummary[]; activeId?: string; runningConvIds?: string[] }
@@ -154,6 +156,7 @@ export type OutMessage =
   | { type: "answerQuestion"; callId: string; answers: Record<string, string[]> }
   | { type: "resolveApproval"; requestId: string; approve?: boolean; pattern?: string; addPattern?: "allow" | "deny"; setMode?: ApprovalMode }
   | { type: "setMode"; mode: Mode }
+  | { type: "setActiveTeams"; teamIds: string[] }
   | { type: "fetchModels" }
   | { type: "selectModel"; model: string }
   | { type: "saveModelOptions"; modelId: string; options: ModelOption[] }

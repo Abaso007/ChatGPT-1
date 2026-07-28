@@ -26,6 +26,15 @@ export interface SubagentDef {
   model?: string;
 }
 
+/** A named group of subagents, selectable as a squad in Project mode. */
+export interface TeamDef {
+  id: string;
+  name: string;
+  description: string;
+  subagentIds: string[];
+  builtin?: boolean;
+}
+
 /** Unified hook events covering OpenCursor, Cursor and Claude Code trigger points. */
 export type HookEvent =
   | "beforeSubmit"
@@ -241,6 +250,8 @@ export interface FeatureConfig {
   customModels: ModelDef[];
   mcpServers: McpServerConfig[];
   subagents: SubagentDef[];
+  teams: TeamDef[];
+  activeTeamIds: string[];
   subagentModel: string;
   autoJudgeModel: string;
   hooks: HookDef[];
@@ -329,6 +340,8 @@ export const EMPTY_FEATURES: FeatureConfig = {
   customModels: [],
   mcpServers: [],
   subagents: [],
+  teams: [],
+  activeTeamIds: [],
   subagentModel: "",
   autoJudgeModel: "",
   hooks: [],

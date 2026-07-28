@@ -12,7 +12,7 @@ import { createPortal } from "react-dom";
 import { ArrowUp, AtSign, ChevronRight, Square } from "lucide-react";
 import { Icon, IconName } from "../../shared/icons";
 import { vscode } from "../../shared/vscode";
-import type { Attachment, FileIconInfo, MentionCategory, MentionItem, Mode, ModelDef, ModelOption, OutMessage } from "../types";
+import type { Attachment, FileIconInfo, MentionCategory, MentionItem, Mode, ModelDef, ModelOption, OutMessage, TeamInfo } from "../types";
 
 /** Cursor-style top-level @ menu categories (same items/order as Cursor). */
 const MENTION_CATEGORIES: { id: MentionCategory; label: string; icon: IconName; leaf?: boolean }[] = [
@@ -220,6 +220,7 @@ const MODES: { id: Mode; label: string; icon: IconName }[] = [
   { id: "agent", label: "Agent", icon: "infinity" },
   { id: "plan", label: "Plan", icon: "list" },
   { id: "multitask", label: "Multitask", icon: "task" },
+  { id: "project", label: "Project", icon: "users" },
   { id: "ask", label: "Ask", icon: "chat" },
 ];
 
@@ -340,6 +341,64 @@ function ModePicker({ mode, onMode }: { mode: Mode; onMode: (m: Mode) => void })
               </span>
               <span className="mi-label">{o.label}</span>
               {o.id === mode && (
+                <span className="mi-check">
+                  <Icon name="check" />
+                </span>
+              )}
+            </div>
+          ))}
+        </div>,
+        document.body
+      )}
+    </span>
+  );
+}
+
+/** Project-mode team selector: pick one or more teams of subagents for the task. */
+function TeamPicker({ teams, selected, onChange }: { teams: TeamInfo[]; selected: string[]; onChange: (ids: string[]) => void }) {
+  const [open, setOpen] = React.useState(false);
+  useOutsideClose(open, () => setOpen(false));
+  const triggerRef = React.useRef<HTMLSpanElement>(null);
+  const menuRef = React.useRef<HTMLDivElement>(null);
+  const { style, maxH } = useAnchoredMenu(open, triggerRef, menuRef, [teams.length]);
+  const picked = teams.filter((t) => selected.includes(t.id));
+  const label = picked.length === 0 ? "No team" : picked.length === 1 ? picked[0].name : `${picked.length} teams`;
+  const toggle = (id: string) => {
+    onChange(selected.includes(id) ? selected.filter((x) => x !== id) : [...selected, id]);
+  };
+  return (
+    <span
+      ref={triggerRef}
+      className="pill mode-pill"
+      title={picked.length ? picked.map((t) => `${t.name}: ${t.members.join(", ")}`).join("\n") : "Select the team(s) that will work on this task"}
+      onClick={(e) => {
+        e.stopPropagation();
+        setOpen((o) => !o);
+      }}
+    >
+      <Icon name="users" />
+      <span>{label}</span>
+      <Icon name="chevD" className="cd" />
+      {open && createPortal(
+        <div ref={menuRef} className="mode-dropdown team-dropdown" style={{ ...style, maxHeight: maxH, overflowY: "auto" }}>
+          {teams.length === 0 && <div className="mode-item">No teams configured</div>}
+          {teams.map((t) => (
+            <div
+              key={t.id}
+              className={"mode-item" + (selected.includes(t.id) ? " active" : "")}
+              onClick={(e) => {
+                e.stopPropagation();
+                toggle(t.id);
+              }}
+            >
+              <span className="mi-icon">
+                <Icon name="users" />
+              </span>
+              <span className="mi-label">
+                {t.name}
+                <span className="mi-sub">{t.members.join(", ") || "no members"}</span>
+              </span>
+              {selected.includes(t.id) && (
                 <span className="mi-check">
                   <Icon name="check" />
                 </span>
@@ -685,9 +744,16 @@ export function Composer({
   usedTokens,
   queuedCount,
   onRunNextQueued,
+  teams,
+  activeTeamIds,
+  onTeams,
 }: {
   mode: Mode;
   onMode: (m: Mode) => void;
+  /** Subagent teams available for Project mode. */
+  teams?: TeamInfo[];
+  activeTeamIds?: string[];
+  onTeams?: (ids: string[]) => void;
   models: string[];
   modelList: ModelDef[];
   selectedModel: string;
@@ -1549,6 +1615,7 @@ export function Composer({
         />
         <div className="composer-bar">
           <ModePicker mode={mode} onMode={onMode} />
+          {mode === "project" && <TeamPicker teams={teams ?? []} selected={activeTeamIds ?? []} onChange={(ids) => onTeams?.(ids)} />}
           <ModelPicker models={models} modelList={modelList} selected={selectedModel} onSelect={onSelectModel} onSaveOptions={onSaveModelOptions} onResetOptions={onResetModelOptions} />
           <div className="right">
             {!editing && (() => {

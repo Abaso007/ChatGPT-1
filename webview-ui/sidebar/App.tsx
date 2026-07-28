@@ -14,7 +14,7 @@ import { vscode } from "../shared/vscode";
 import { Composer, KIND_SVG, applyFileIconTo } from "./components/Composer";
 import { ToolCard, isReadonlySubagent, TimeoutBadge, ToolTimeoutWatch, isToolCountdownActive, useLiveDisclosure } from "./components/Tool";
 import { History } from "./components/History";
-import type { AgentEvent, ApprovalMode, ApprovalRequestInfo, AssistantBlock, AssistantTurn, Attachment, ConversationSummary, ErrorBlock, InMessage, MentionItem, Mode, ModelDef, ModelOption, OutMessage, PendingChangeInfo, PersonaInfo, ThinkingBlock, ToolBlock, Turn, UserTurn } from "./types";
+import type { AgentEvent, ApprovalMode, ApprovalRequestInfo, AssistantBlock, AssistantTurn, Attachment, ConversationSummary, ErrorBlock, InMessage, MentionItem, Mode, ModelDef, ModelOption, OutMessage, PendingChangeInfo, PersonaInfo, TeamInfo, ThinkingBlock, ToolBlock, Turn, UserTurn } from "./types";
 import { applyEvent, applyToBlocks, closeTrailingThinking, forceSettleOpenWork, parsePartialArgs, renderMentionTokens } from "./types";
 
 function post(msg: OutMessage) {
@@ -668,6 +668,8 @@ export function App() {
   const [personas, setPersonas] = React.useState<PersonaInfo[]>([]);
   const [personaId, setPersonaId] = React.useState("default");
   const [hasProviders, setHasProviders] = React.useState(true);
+  const [teams, setTeams] = React.useState<TeamInfo[]>([]);
+  const [activeTeamIds, setActiveTeamIds] = React.useState<string[]>([]);
   const [uiPrefs, setUiPrefs] = React.useState<{ chatTextSize: string; submitWithCtrlEnter: boolean; maxTabCount: number; completionSound: boolean }>({ chatTextSize: "default", submitWithCtrlEnter: false, maxTabCount: 0, completionSound: false });
   const uiPrefsRef = React.useRef(uiPrefs);
   React.useEffect(() => { uiPrefsRef.current = uiPrefs; }, [uiPrefs]);
@@ -983,6 +985,8 @@ export function App() {
           setPersonas(msg.personas || []);
           setPersonaId(msg.activePersonaId || "default");
           setHasProviders(!!msg.hasProviders);
+          if (msg.teams) setTeams(msg.teams);
+          if (msg.activeTeamIds) setActiveTeamIds(msg.activeTeamIds);
           if (msg.uiPrefs) setUiPrefs(msg.uiPrefs);
           if (msg.activeId) setOpenTabs((t) => t.includes(msg.activeId!) ? t : [...t, msg.activeId!]);
           force();
@@ -993,6 +997,8 @@ export function App() {
         case "configState":
           setPersonas(msg.personas || []);
           setHasProviders(!!msg.hasProviders);
+          if (msg.teams) setTeams(msg.teams);
+          if (msg.activeTeamIds) setActiveTeamIds(msg.activeTeamIds);
           if (msg.uiPrefs) setUiPrefs(msg.uiPrefs);
           // Only follow the global default persona for brand-new (empty) chats.
           if (sessionFor(activeIdRef.current).turns.length === 0) setPersonaId(msg.activePersonaId || "default");
@@ -1494,6 +1500,12 @@ export function App() {
                           setMode(m);
                           post({ type: "setMode", mode: m });
                         }}
+                        teams={teams}
+                        activeTeamIds={activeTeamIds}
+                        onTeams={(ids) => {
+                          setActiveTeamIds(ids);
+                          post({ type: "setActiveTeams", teamIds: ids });
+                        }}
                         models={models}
                         modelList={modelList}
                         selectedModel={selectedModel}
@@ -1712,6 +1724,12 @@ export function App() {
           onMode={(m) => {
             setMode(m);
             post({ type: "setMode", mode: m });
+          }}
+          teams={teams}
+          activeTeamIds={activeTeamIds}
+          onTeams={(ids) => {
+            setActiveTeamIds(ids);
+            post({ type: "setActiveTeams", teamIds: ids });
           }}
           models={models}
           modelList={modelList}

@@ -315,8 +315,7 @@ def({
       readonly: { type: "boolean", description: "If true, the subagent will run in readonly mode (\"Ask mode\") with restricted write operations and no MCP or internet access." },
       subagent_type: {
         type: "string",
-        enum: ["generalPurpose", "explore", "shell", "cursor-guide", "ci-investigator", "bugbot", "security-review", "best-of-n-runner", "docs-researcher", "code-reviewer"],
-        description: "Subagent type to use for this task. Must be one of: generalPurpose, explore, shell, cursor-guide, ci-investigator, bugbot, security-review, best-of-n-runner, docs-researcher, code-reviewer.",
+        description: "Subagent type to use for this task. Either one of the built-in types (generalPurpose, explore, shell, cursor-guide, ci-investigator, bugbot, security-review, best-of-n-runner, docs-researcher, code-reviewer) or the name of a configured subagent — including a member of an assigned team listed in <assigned_teams> or <subagents>.",
       },
       file_attachments: { type: "array", items: { type: "string" }, description: "Optional array of file paths to images or videos to pass to video-review subagents. Files are read and attached to the subagent's context. Use to forward relevant media (e.g. images sent by user) to subagents." },
       interrupt: { type: "boolean", description: "If true and `resume` targets a running async agent, interrupt the current run and send this prompt immediately. Only use when the user explicitly asks to interrupt or change what the running agent is doing." },

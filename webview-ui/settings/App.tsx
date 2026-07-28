@@ -70,7 +70,7 @@ const NAV: { id: Section; label: string; icon: IconName; sep?: boolean }[] = [
   { id: "models", label: "Models", icon: "model" },
   { id: "behavior", label: "Behavior", icon: "tools" },
   { id: "personas", label: "Personas", icon: "bot", sep: true },
-  { id: "rules", label: "Rules, Skills, Subagents", icon: "ruler" },
+  { id: "rules", label: "Rules, Skills, Subagents, Teams", icon: "ruler" },
   { id: "mcp", label: "Tools & MCPs", icon: "task" },
   { id: "hooks", label: "Hooks", icon: "infinity" },
   { id: "indexing", label: "Indexing & Docs", icon: "database" },

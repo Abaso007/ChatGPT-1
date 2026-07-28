@@ -327,6 +327,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         case "setMode":
           this._currentMode = data.mode;
           break;
+        case "setActiveTeams":
+          await this.featureStore.set({ activeTeamIds: data.teamIds });
+          break;
         case "fetchModels":
           await this._handleFetchModels();
           break;
@@ -602,6 +605,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       personas: allPersonas(features.customPersonas).map((p) => ({ id: p.id, name: p.name, description: p.description })),
       activePersonaId: active?.personaId ?? features.activePersonaId,
       hasProviders: features.providers.some(providerEnabled) || oauth.hasAnyAccount(),
+      teams: this._teamSummaries(features),
+      activeTeamIds: features.activeTeamIds ?? [],
       runningConvIds: [...this._sessions.keys()],
       uiPrefs: {
         chatTextSize: features.chatTextSize ?? "default",
@@ -732,6 +737,18 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this._sendConversations();
   }
 
+  /** Team list for the composer's Project-mode picker (member names resolved). */
+  private _teamSummaries(features: ReturnType<FeatureStore["get"]>) {
+    return (features.teams ?? []).map((t) => ({
+      id: t.id,
+      name: t.name,
+      description: t.description,
+      members: t.subagentIds
+        .map((sid) => features.subagents.find((s) => s.id === sid)?.name)
+        .filter((n): n is string => !!n),
+    }));
+  }
+
   /** Push live persona list + provider availability to the webview. */
   private _sendConfigState() {
     const features = this.featureStore.get();
@@ -741,6 +758,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       personas: allPersonas(features.customPersonas).map((p) => ({ id: p.id, name: p.name, description: p.description })),
       activePersonaId: active?.personaId ?? features.activePersonaId,
       hasProviders: features.providers.some(providerEnabled) || oauth.hasAnyAccount(),
+      teams: this._teamSummaries(features),
+      activeTeamIds: features.activeTeamIds ?? [],
       uiPrefs: {
         chatTextSize: features.chatTextSize ?? "default",
         submitWithCtrlEnter: features.submitWithCtrlEnter === true,
@@ -1570,6 +1589,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         enableWebFetch: features.webFetchEnabled !== false,
         approve: (toolName, input, callId) => this._approveTool(convId, session, toolName, input, callId),
         customSubagents: features.subagents,
+        teams: features.teams,
+        activeTeamIds: features.activeTeamIds,
         subagentModel: features.subagentModel,
         availableModels: this._modelsForProvider(prov.providerId, prov.oauthKind),
         registerSubagentAbort: (callId, abort) => {

@@ -20,6 +20,7 @@ import { mcpManager } from "../integrations/mcpClient";
 import type { AgentEvent, Attachment, Mode, Step, ToolCall, ToolSchema } from "./types";
 import type { SubagentDef } from "../stores/featureStore";
 import type { RunAgentOptions } from "./loopTypes";
+import { buildTeamsBlock, resolveTeamSubagents } from "./teams";
 import {
 	streamPolicyFor,
 	clipArgsText,
@@ -37,6 +38,13 @@ const MULTITASK_REMINDER =
 	"Do NOT edit files, run terminal commands, or do the work yourself — the edit tools are DISABLED and will refuse. " +
 	"Break the request into independent units, then delegate EVERY unit to a background subagent via the Task tool " +
 	"(run_in_background=true), launching multiple subagents AT THE SAME TIME in a single turn.\n</reminder>";
+
+// Project-mode counterpart: the model is the lead of the assigned team(s).
+const PROJECT_REMINDER =
+	"<reminder>\nYou are in PROJECT mode: you are the PROJECT LEAD of the team(s) in <assigned_teams>, not an implementer. " +
+	"Do NOT edit files or run terminal commands yourself — those tools are DISABLED and will refuse. " +
+	"Plan the project with TodoWrite, then delegate each unit of work to the right team member with the Task tool " +
+	'(run_in_background=true, subagent_type set to the member name), launching every independent member AT THE SAME TIME in a single turn.\n</reminder>';
 
 const MAX_STEPS = 50;
 
@@ -167,7 +175,7 @@ function coalesceEmit(raw: (e: AgentEvent) => void): (e: AgentEvent) => void {
 }
 
 export async function runAgent(opts: RunAgentOptions): Promise<void> {
-	const { apiBaseUrl, apiKey, model, prompt, attachments, history: persistedHistory, maxTokens, maxSteps, autoContinue, contextTokens, sampling, modelParams, anthropic, oauthKind, systemPromptOverride, extraInstructions, enableFileReading, enableTerminalSuggestions, enableWorkspaceContext, approve, isSubagent, customSubagents, subagentModel, availableModels, registerSubagentAbort, askUser, onAfterRun, onBeforeShell, onAfterEdit, onHook, signal, emit: rawEmit } = opts;
+	const { apiBaseUrl, apiKey, model, prompt, attachments, history: persistedHistory, maxTokens, maxSteps, autoContinue, contextTokens, sampling, modelParams, anthropic, oauthKind, systemPromptOverride, extraInstructions, enableFileReading, enableTerminalSuggestions, enableWorkspaceContext, approve, isSubagent, customSubagents, teams, activeTeamIds, subagentModel, availableModels, registerSubagentAbort, askUser, onAfterRun, onBeforeShell, onAfterEdit, onHook, signal, emit: rawEmit } = opts;
 	// Model history is disposable and may be compacted/pruned. Persisted history
 	// remains lossless for chat display/export, including full tool output/thinking.
 	const history: Step[] = persistedHistory.map((s) => structuredClone(s));
@@ -178,8 +186,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	const emit = coalesceEmit(rawEmit);
 	// Mutable so the SwitchMode tool can change it mid-run.
 	let mode = opts.mode;
-	// multitask is agentic (full tool access); treat it like agent for gating.
-	const isAgentic = () => mode === "agent" || mode === "multitask" || mode === "debug";
+	// multitask/project are agentic (full tool access); treat them like agent for gating.
+	const isAgentic = () => mode === "agent" || mode === "multitask" || mode === "project" || mode === "debug";
+	/** Coordinator modes: the model delegates instead of implementing. */
+	const isCoordinator = () => mode === "multitask" || mode === "project";
+	// In project mode the roster is limited to the members of the assigned team(s).
+	const teamRoster =
+		opts.mode === "project" && teams?.length && activeTeamIds?.length
+			? resolveTeamSubagents(teams, customSubagents ?? [], activeTeamIds)
+			: undefined;
+	const roster = teamRoster?.length ? teamRoster : customSubagents;
 	// In-flight background subagents. The run is not "finished" until these settle,
 	// so the chat stays busy (and can't be closed) while they keep working. When they
 	// finish, their summaries are fed back into the loop so the model can synthesize.
@@ -219,7 +235,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			if (opts?.resume) {
 				return "error: resuming or forking subagents is not supported in this runtime; launch a fresh subagent instead.";
 			}
-			const def = subagentName ? customSubagents?.find((s) => s.name.toLowerCase() === subagentName.toLowerCase()) : undefined;
+			const def = subagentName ? roster?.find((s) => s.name.toLowerCase() === subagentName.toLowerCase()) : undefined;
 			const subReadonly = def ? def.readonly : readonly;
 			const subSystemOverride = def ? def.prompt : systemPromptOverride;
 			// Model precedence: explicit task model → per-subagent override → global subagent model → chat model.
@@ -345,9 +361,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	if (!isSubagent) {
 		try {
 			let userInfo = await buildUserInfoBlock({ userRules: extraInstructions, enableWorkspaceContext });
-			if (customSubagents && customSubagents.length) {
-				const list = customSubagents.map((s) => `- ${s.name}${s.readonly ? " (read-only)" : ""}: ${s.description}`).join("\n");
-				userInfo += `\n\n<subagents>\nLaunch one of these with the task tool by setting "subagent" to its name:\n${list}\n</subagents>`;
+			if (roster && roster.length) {
+				const list = roster.map((s) => `- ${s.name}${s.readonly ? " (read-only)" : ""}: ${s.description}`).join("\n");
+				userInfo += `\n\n<subagents>\nLaunch one of these with the Task tool by setting "subagent_type" to its name:\n${list}\n</subagents>`;
+			}
+			if (opts.mode === "project" && teams?.length && activeTeamIds?.length) {
+				userInfo += buildTeamsBlock(teams, customSubagents ?? [], activeTeamIds);
 			}
 			const openFiles = enableWorkspaceContext !== false ? await buildOpenFilesBlock() : "";
 			cursorCtx = { userInfo, openFiles };
@@ -578,7 +597,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				onHook?.("preCompact", { dropped: String(history.length - fitted.length) });
 			}
 			const liveCtx = cursorCtx
-				? { ...cursorCtx, reminder: mode === "multitask" ? MULTITASK_REMINDER : undefined, timestamp: runTimestamp }
+				? { ...cursorCtx, reminder: mode === "multitask" ? MULTITASK_REMINDER : mode === "project" ? PROJECT_REMINDER : undefined, timestamp: runTimestamp }
 				: cursorCtx;
 			const messages = buildMessages(system, fitted, liveCtx);
 			let assistantText = "";
@@ -797,7 +816,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				}
 				// MCP tool dispatch (same hard timeout + countdown as built-ins).
 				if (call.name.startsWith("mcp__")) {
-					if (!isAgentic() || mode === "multitask") {
+					if (!isAgentic() || isCoordinator()) {
 						// MCP tools may mutate; only allow in agentic modes. Multitask is a
 						// coordinator and must delegate MCP work to subagents.
 						results[i] = { status: "error", output: `MCP tools not allowed in ${mode} mode` };
@@ -871,12 +890,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					results[i] = { status: "error", output: `unknown or disabled tool: ${call.name}` };
 					return;
 				}
-				// Multitask is a coordinator: it can read/search/manage todos but must
-				// never mutate files or the shell — delegate that to a subagent.
-				if (mode === "multitask" && !MULTITASK_TOOLS.has(call.name)) {
+				// Multitask/project are coordinators: they can read/search/manage todos but
+				// must never mutate files or the shell — delegate that to a subagent.
+				if (isCoordinator() && !MULTITASK_TOOLS.has(call.name)) {
 					results[i] = {
 						status: "error",
-						output: `tool ${call.name} not allowed in multitask mode — delegate file/shell edits to a background subagent with the Task tool.`,
+						output: `tool ${call.name} not allowed in ${mode} mode — delegate file/shell edits to a background subagent with the Task tool.`,
 					};
 					return;
 				}

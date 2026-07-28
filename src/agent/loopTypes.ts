@@ -12,6 +12,7 @@ import type { OAuthKind } from "./oauth";
 import type { AskQuestionItem } from "./tools";
 import type { AgentEvent, Attachment, Mode, Step } from "./types";
 import type { SubagentDef } from "../stores/featureStore";
+import type { TeamDef } from "./teams";
 
 /** Every input needed to drive a single {@link runAgent} run. */
 export interface RunAgentOptions {
@@ -44,6 +45,10 @@ export interface RunAgentOptions {
 	approve?: (toolName: string, input: any, callId?: string) => Promise<boolean | { approved: false; blockedSubject: string }>;
 	isSubagent?: boolean;
 	customSubagents?: SubagentDef[];
+	/** All configured subagent teams. */
+	teams?: TeamDef[];
+	/** Teams assigned to this run (Project mode). */
+	activeTeamIds?: string[];
 	/** Default model for subagents ("" = inherit this run's model). */
 	subagentModel?: string;
 	/** Model ids selectable for this run's provider; a Task model outside this list is ignored. */
