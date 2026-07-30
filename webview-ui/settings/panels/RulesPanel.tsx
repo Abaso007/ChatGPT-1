@@ -41,8 +41,25 @@ export function RulesPanel({
   const [confirm, setConfirm] = React.useState<{ kind: "subagent" | "team"; id: string; name: string } | null>(null);
 
   const saveSub = (value: SubagentDef) => {
-    const exists = subagents.some((s) => s.id === value.id);
-    setFeatures({ subagents: exists ? subagents.map((s) => (s.id === value.id ? value : s)) : [...subagents, value] });
+    // Built-in presets always come from source — saving an edited builtin clones it.
+    if (value.builtin) {
+      const taken = new Set(subagents.map((s) => s.name.toLowerCase()));
+      let name = value.name.trim();
+      if (taken.has(name.toLowerCase())) {
+        name = /(?:-custom| \(copy\))$/i.test(name) ? `${name}-2` : `${name}-custom`;
+      }
+      const clone: SubagentDef = { ...value, id: uid("sub"), name, builtin: false };
+      setFeatures({ subagents: [...subagents.filter((s) => !s.builtin), clone] });
+      setSubDraft(null);
+      return;
+    }
+    const customs = subagents.filter((s) => !s.builtin);
+    const exists = customs.some((s) => s.id === value.id);
+    setFeatures({
+      subagents: exists
+        ? subagents.map((s) => (s.id === value.id ? { ...value, builtin: false } : s))
+        : [...customs, { ...value, builtin: false }],
+    });
     setSubDraft(null);
   };
   const deleteSub = (id: string) =>
@@ -53,8 +70,24 @@ export function RulesPanel({
     });
 
   const saveTeam = (value: TeamDef) => {
-    const exists = teams.some((t) => t.id === value.id);
-    setFeatures({ teams: exists ? teams.map((t) => (t.id === value.id ? value : t)) : [...teams, value] });
+    if (value.builtin) {
+      const clone: TeamDef = {
+        ...value,
+        id: uid("team"),
+        name: / \(copy\)$/.test(value.name) ? value.name : `${value.name} (copy)`,
+        builtin: false,
+      };
+      setFeatures({ teams: [...teams.filter((t) => !t.builtin), clone] });
+      setTeamDraft(null);
+      return;
+    }
+    const customs = teams.filter((t) => !t.builtin);
+    const exists = customs.some((t) => t.id === value.id);
+    setFeatures({
+      teams: exists
+        ? teams.map((t) => (t.id === value.id ? { ...value, builtin: false } : t))
+        : [...customs, { ...value, builtin: false }],
+    });
     setTeamDraft(null);
   };
   const deleteTeam = (id: string) =>
@@ -189,17 +222,24 @@ export function RulesPanel({
           <tbody>
             {subagents.map((sub) => (
               <tr key={sub.id} onDoubleClick={() => setSubDraft({ value: sub, isNew: false })}>
-                <td className="c-name" title={sub.name}>{sub.name || "(unnamed)"}</td>
+                <td className="c-name" title={sub.name}>
+                  {sub.name || "(unnamed)"}
+                  {sub.builtin && <span className="badge-tag always" style={{ marginLeft: 6 }}>built-in</span>}
+                </td>
                 <td className="c-desc" title={sub.description}>{sub.description || "—"}</td>
                 <td className="c-mode">
                   <span className={"badge-tag " + (sub.readonly ? "glob" : "always")}>{sub.readonly ? "read-only" : "read-write"}</span>
                 </td>
                 <td className="c-model" title={sub.model || "Inherits the subagent / chat model"}>{sub.model || "inherit"}</td>
                 <td className="c-actions">
-                  <button className="btn-ghost sm" onClick={() => setSubDraft({ value: sub, isNew: false })}>Edit</button>
-                  <button className="icon-btn" title="Delete subagent" onClick={() => setConfirm({ kind: "subagent", id: sub.id, name: sub.name })}>
-                    <Icon name="trash" size={13} />
+                  <button className="btn-ghost sm" onClick={() => setSubDraft({ value: sub, isNew: false })} title={sub.builtin ? "View / clone preset" : "Edit"}>
+                    {sub.builtin ? "View" : "Edit"}
                   </button>
+                  {!sub.builtin && (
+                    <button className="icon-btn" title="Delete subagent" onClick={() => setConfirm({ kind: "subagent", id: sub.id, name: sub.name })}>
+                      <Icon name="trash" size={13} />
+                    </button>
+                  )}
                 </td>
               </tr>
             ))}
@@ -252,7 +292,9 @@ export function RulesPanel({
                   <td className="c-desc" title={names.join(", ")}>{names.join(", ") || "no members"}</td>
                   <td className="c-count">{team.subagentIds.length}</td>
                   <td className="c-actions">
-                    <button className="btn-ghost sm" onClick={() => setTeamDraft({ value: team, isNew: false })}>Edit</button>
+                    <button className="btn-ghost sm" onClick={() => setTeamDraft({ value: team, isNew: false })}>
+                      {team.builtin ? "View" : "Edit"}
+                    </button>
                     <button className="icon-btn" title="Duplicate team" onClick={() => cloneTeam(team)}>
                       <Icon name="copy" size={13} />
                     </button>
@@ -333,12 +375,13 @@ function SubagentModal({
   const [draft, setDraft] = React.useState<SubagentDef>(subagent);
   const set = (patch: Partial<SubagentDef>) => setDraft((d) => ({ ...d, ...patch }));
   const name = draft.name.trim();
-  // The agent selects a subagent by name, so it must be unique and token-like.
+  const norm = (n: string) => n.trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+  // The agent selects a subagent by name — keep it unique (including kebab/space variants).
   const error = !name
     ? "A name is required."
-    : /\s/.test(name)
-      ? "Use a single word without spaces (e.g. backend-developer)."
-      : existingNames.some((n) => n.trim().toLowerCase() === name.toLowerCase())
+    : name.length < 2
+      ? "Name is too short."
+      : existingNames.some((n) => n.trim().toLowerCase() === name.toLowerCase() || norm(n) === norm(name))
         ? "Another subagent already uses this name."
         : !draft.description.trim()
           ? "A description is required — the agent uses it to decide when to delegate."
@@ -348,7 +391,7 @@ function SubagentModal({
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal modal-lg" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
-          <h2>{isNew ? "New Subagent" : "Edit Subagent"}</h2>
+          <h2>{isNew ? "New Subagent" : subagent.builtin ? "Built-in Subagent" : "Edit Subagent"}</h2>
           <button className="icon-btn close" onClick={onClose} title="Close">
             <Icon name="close" size={16} />
           </button>
@@ -356,8 +399,8 @@ function SubagentModal({
         <div className="modal-body">
           <label className="fc-field">
             <span>Name</span>
-            <input value={draft.name} onChange={(e) => set({ name: e.target.value })} placeholder="backend-developer" autoFocus />
-            <span className="fc-help">The agent passes this as <code>subagent_type</code> when delegating. One word, no spaces.</span>
+            <input value={draft.name} onChange={(e) => set({ name: e.target.value })} placeholder="Backend Developer" autoFocus />
+            <span className="fc-help">Display name used as <code>subagent_type</code> when the agent delegates (e.g. Backend Developer).</span>
           </label>
           <label className="fc-field">
             <span>Description</span>
@@ -391,12 +434,15 @@ function SubagentModal({
             />
             <span className="fc-help">Replaces the persona for this subagent's run. Leave empty to inherit the chat's system prompt.</span>
           </label>
+          {subagent.builtin && (
+            <div className="row-desc">This is a shipped preset. Saving creates a custom copy; the original stays available for Project mode teams.</div>
+          )}
           {error && <div className="fc-error">{error}</div>}
         </div>
         <div className="modal-foot">
           <button className="btn-ghost" onClick={onClose}>Cancel</button>
           <button className="btn-primary" disabled={!!error} onClick={() => onSave({ ...draft, name, description: draft.description.trim() })}>
-            {isNew ? "Create Subagent" : "Save Changes"}
+            {isNew ? "Create Subagent" : subagent.builtin ? "Clone as Custom" : "Save Changes"}
           </button>
         </div>
       </div>
@@ -429,7 +475,7 @@ function TeamModal({
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal modal-lg" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
-          <h2>{isNew ? "New Team" : "Edit Team"}</h2>
+          <h2>{isNew ? "New Team" : team.builtin ? "Built-in Team" : "Edit Team"}</h2>
           <button className="icon-btn close" onClick={onClose} title="Close">
             <Icon name="close" size={16} />
           </button>
@@ -475,7 +521,7 @@ function TeamModal({
         <div className="modal-foot">
           <button className="btn-ghost" onClick={onClose}>Cancel</button>
           <button className="btn-primary" disabled={!!error} onClick={() => onSave({ ...draft, name, description: draft.description.trim() })}>
-            {isNew ? "Create Team" : "Save Changes"}
+            {isNew ? "Create Team" : team.builtin ? "Clone as Custom" : "Save Changes"}
           </button>
         </div>
       </div>

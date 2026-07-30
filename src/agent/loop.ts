@@ -30,7 +30,7 @@ import { mcpManager } from "../integrations/mcpClient";
 import type { AgentEvent, Attachment, Mode, Step, ToolCall, ToolSchema } from "./types";
 import type { SubagentDef } from "../stores/featureStore";
 import type { RunAgentOptions } from "./loopTypes";
-import { buildTeamsBlock, resolveTeamSubagents } from "./teams";
+import { buildTeamsBlock, findSubagentByName, resolveTeamSubagents } from "./teams";
 import {
 	streamPolicyFor,
 	clipArgsText,
@@ -276,7 +276,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			if (opts?.resume) {
 				return "error: resuming or forking subagents is not supported in this runtime; launch a fresh subagent instead.";
 			}
-			const def = subagentName ? roster?.find((s) => s.name.toLowerCase() === subagentName.toLowerCase()) : undefined;
+			const def = subagentName ? findSubagentByName(roster, subagentName) : undefined;
 			const subReadonly = def ? def.readonly : readonly;
 			const subSystemOverride = def ? def.prompt : systemPromptOverride;
 			// Model precedence: explicit task model → per-subagent override → global subagent model → chat model.

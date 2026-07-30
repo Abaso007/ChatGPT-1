@@ -24,6 +24,7 @@ export interface SubagentDef {
   prompt: string;
   readonly: boolean;
   model?: string;
+  builtin?: boolean;
 }
 
 /** A named group of subagents, selectable as a squad in Project mode. */

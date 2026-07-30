@@ -13,7 +13,7 @@ import type { Persona } from "../agent/personas";
 import type { LlamacppModel, LlamacppServerConfig } from "../agent/llamacpp";
 import { DEFAULT_APPROVAL, type ApprovalPolicy } from "../agent/approvalPolicy";
 import type { DocSource } from "../agent/docsIndex";
-import { type TeamDef, withBuiltinTeamSubagents, withBuiltinTeams } from "../agent/teams";
+import { type TeamDef, withBuiltinTeamSubagents, withBuiltinTeams, withoutBuiltinTeamSubagents, withoutBuiltinTeams } from "../agent/teams";
 
 export type { TeamDef };
 
@@ -25,6 +25,8 @@ export interface SubagentDef {
 	readonly: boolean;
 	/** Optional model override for this subagent (else uses subagentModel / chat model). */
 	model?: string;
+	/** Built-in presets cannot be deleted; edits should be cloned. */
+	builtin?: boolean;
 }
 
 /** Unified hook events covering OpenCursor, Cursor and Claude Code trigger points. */
@@ -345,9 +347,16 @@ export class FeatureStore {
 
 	async set(patch: Partial<FeatureConfig>): Promise<FeatureConfig> {
 		const next = { ...this.get(), ...patch };
-		await this.context.globalState.update(KEY, next);
+		// Builtins are always injected from source on get() — do not persist their
+		// prompts/fields, or shipped updates would be frozen in globalState forever.
+		const toStore: FeatureConfig = {
+			...next,
+			subagents: withoutBuiltinTeamSubagents(next.subagents ?? []),
+			teams: withoutBuiltinTeams(next.teams ?? []),
+		};
+		await this.context.globalState.update(KEY, toStore);
 		this._onDidChange.fire();
-		return next;
+		return this.get();
 	}
 
 	/** Notify listeners of a config change that happened outside `set` (e.g. provider keys). */
