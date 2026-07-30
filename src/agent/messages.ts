@@ -23,10 +23,13 @@ const EPHEMERAL: CacheControl = { type: "ephemeral" };
  * before raw context, after dump bodies and edit payloads have been hard-slimmed.
  * A group is an assistant's tool_calls plus the results that answer them, so a
  * trim can never orphan a call and produce an invalid request.
+ *
+ * `overheadTokens` must cover everything that rides along outside the steps —
+ * system prompt *and* tool schemas. Counting only the system prompt made this
+ * "guaranteed fit" pass overshoot the real window by the schema block (10k+).
  */
-export function fitStepsToBudget(steps: Step[], system: string, budgetTokens: number): Step[] {
-  const sysTokens = Math.ceil(system.length / 4);
-  const budget = budgetTokens - sysTokens;
+export function fitStepsToBudget(steps: Step[], overheadTokens: number, budgetTokens: number): Step[] {
+  const budget = budgetTokens - overheadTokens;
   if (budget <= 0) return steps;
 
   // Clone + hard-slim dumps so we do not mutate the live history further, and

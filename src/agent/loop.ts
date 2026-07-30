@@ -707,7 +707,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			}
 			// 2) Trim fallback: guarantees the request fits even if summarization
 			// didn't run or wasn't enough (rare).
-			const fitted = budget > 0 ? fitStepsToBudget(history, system, budget) : history;
+			const fitted = budget > 0 ? fitStepsToBudget(history, overheadTokens, budget) : history;
 			if (fitted !== history && fitted.length < history.length) {
 				onHook?.("preCompact", { dropped: String(history.length - fitted.length) });
 			}
