@@ -11,7 +11,7 @@ import * as React from "react";
 import { Icon, IconName } from "../shared/icons";
 import { vscode } from "../shared/vscode";
 import { ApprovalActionType, ApprovalMode, ApprovalPolicy, DEFAULT_APPROVAL, EMPTY_FEATURES, FeatureConfig, LlamacppStatus, McpStatus, ModelDef, ModelUsage, OAUTH_LABEL, OAuthStatus, OllamaModel, OllamaStatus, Persona, RuleInfo, SkillInfo } from "./features";
-import { HooksPanel, LlamacppPanel, McpPanel, ModelsPanel, OAuthAccountCard, OllamaPanel, PersonasPanel, ProvidersPanel, RulesPanel } from "./FeaturePanels";
+import { HooksPanel, LlamacppPanel, McpPanel, ModelsPanel, OAuthAccountCard, OllamaPanel, PersonasPanel, ProvidersPanel, RulesPanel, SubagentsPanel } from "./FeaturePanels";
 import { ModelSelect } from "../shared/ModelSelect";
 
 interface Settings {
@@ -32,7 +32,7 @@ const DEFAULTS: Settings = {
   systemPrompt: "",
 };
 
-type Section = "general" | "usage" | "agents" | "providers" | "models" | "llamacpp" | "ollama" | "behavior" | "personas" | "rules" | "mcp" | "hooks" | "indexing" | "advanced" | "about";
+type Section = "general" | "usage" | "agents" | "providers" | "models" | "llamacpp" | "ollama" | "behavior" | "personas" | "rules" | "subagents" | "mcp" | "hooks" | "indexing" | "advanced" | "about";
 
 interface IndexStatus {
   indexing: boolean;
@@ -70,7 +70,8 @@ const NAV: { id: Section; label: string; icon: IconName; sep?: boolean }[] = [
   { id: "models", label: "Models", icon: "model" },
   { id: "behavior", label: "Behavior", icon: "tools" },
   { id: "personas", label: "Personas", icon: "bot", sep: true },
-  { id: "rules", label: "Rules, Skills, Subagents, Teams", icon: "ruler" },
+  { id: "rules", label: "Rules & Skills", icon: "ruler" },
+  { id: "subagents", label: "Subagents & Teams", icon: "agent" },
   { id: "mcp", label: "Tools & MCPs", icon: "task" },
   { id: "hooks", label: "Hooks", icon: "infinity" },
   { id: "indexing", label: "Indexing & Docs", icon: "database" },
@@ -114,7 +115,8 @@ const SECTION_KEYWORDS: Partial<Record<Section, string>> = {
   providers: "api key openai anthropic google openrouter oauth custom base url connect",
   behavior: "workspace context file reading terminal tools auto edits approval allow deny ask review policy allowlist denylist commands mcp web",
   personas: "persona system prompt custom",
-  rules: "rules skills subagents",
+  rules: "rules skills agents.md always apply glob",
+  subagents: "subagents teams squad project mode delegate task tool members roster subagent model",
   mcp: "mcp tools servers",
   hooks: "hooks events commands",
   indexing: "codebase index embedding docs semantic sync",
@@ -974,17 +976,9 @@ export function App() {
               </Group>
 
               <div className="section-label">Subagents</div>
-              <Group>
-                <Row title="Subagent Model" desc="Default model for subagents launched via the Task tool.">
-                  <ModelSelect
-                    models={modelList}
-                    value={features.subagentModel}
-                    onChange={(id) => setFeatures({ subagentModel: id })}
-                    customItems={[{ value: "", label: "Inherit chat model", desc: "use whatever the chat uses" }]}
-                    style={{ maxWidth: 240 }}
-                  />
-                </Row>
-              </Group>
+              <p className="panel-hint">
+                Subagents, teams and the default subagent model live in the <button className="link-btn" onClick={() => setSection("subagents")}>Subagents &amp; Teams</button> tab.
+              </p>
 
               <div className="section-label">Context</div>
               <Group>
@@ -1029,7 +1023,9 @@ export function App() {
 
           {section === "personas" && <PersonasPanel features={features} setFeatures={setFeatures} builtinPersonas={builtinPersonas} />}
 
-          {section === "rules" && <RulesPanel features={features} setFeatures={setFeatures} rules={rules} skills={skills} models={models} modelList={modelList} />}
+          {section === "rules" && <RulesPanel rules={rules} skills={skills} />}
+
+          {section === "subagents" && <SubagentsPanel features={features} setFeatures={setFeatures} models={models} modelList={modelList} />}
 
           {section === "mcp" && (
             <McpPanel
