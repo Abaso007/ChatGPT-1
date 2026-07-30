@@ -4,6 +4,24 @@ All notable changes to the "ocursor" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.1.1] - 2026-07-30
+
+### Added
+
+- Project mode: the agent acts as a project lead and delegates work to a team of subagents, with team selection in the composer and the active team shown in the sidebar
+- `TeamDef` teams with built-in presets (Product Manager, and the rest of the default crew) sharing a common protocol for context isolation, role discipline, and code quality
+- Built-in subagents and teams can be cloned into editable copies; duplicates get unique names automatically, and custom entities are kept separate from built-ins via a `builtin` flag
+- Subagent and team management UI in the settings panel with a table layout for subagents and more responsive modals
+- Task and Subagent cards show the subagent type name as a chip for clearer run context
+- Durable `ActivityLedger` that records tool actions outside the message history, so past work stays visible without bloating context
+
+### Changed
+
+- Context economy reworked: history is economized around retained recent work, steps are grouped before budget fitting, and system messages carry synthetic markers
+- `fitStepsToBudget` now accounts for overhead tokens (system prompt and tool schemas) so requests fit the real budget
+- Semantic index throttles rebuilds and delays the startup build during activation; index data structures were reworked for lower memory use, and the search tool avoids unnecessary rebuilds
+- Cache invalidation for the index is more precise, with new chunking and embedding constants
+
 ## [0.1.0] - 2026-07-27
 
 ### Added
