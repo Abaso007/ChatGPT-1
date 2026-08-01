@@ -12,7 +12,7 @@ import type { TodoItem } from "./tools";
 /**
  * Durable run memory that lives outside the message history.
  *
- * History gets pruned, summarized and trimmed; this ledger does not. It records
+ * History may be summarized or trimmed at the budget ceiling; this ledger does not. It records
  * one short line per tool call — what was done, to what, and how it ended — so a
  * compacted conversation still knows everything that happened, without carrying
  * a single line of file content. Rendered fresh on every step, so it costs the
@@ -170,6 +170,6 @@ export class ActivityLedger {
 		}
 
 		if (!parts.length) return "";
-		return `<task_state>\nDurable record of this run. It survives context compaction, so trust it over your recollection. Results are summarized — re-read a file or re-run a command if you need its content again.\n\n${parts.join("\n\n")}\n</task_state>`;
+		return `<task_state>\nDurable record of this run. It survives context compaction, so trust it over your recollection. Notes are brief — re-read a file or re-run a command if you need its full content again.\n\n${parts.join("\n\n")}\n</task_state>`;
 	}
 }

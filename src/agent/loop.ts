@@ -59,14 +59,6 @@ const PROJECT_REMINDER =
 const MAX_STEPS = 50;
 
 /**
- * Don't rewrite history for token economy until the window is this full.
- * Pruning invalidates the provider prompt cache from the first rewritten message
- * onward, so doing it early costs more than it saves — and full fidelity is the
- * best memory there is while the context still has room.
- */
-const ECONOMIZE_AT_FILL = 0.5;
-
-/**
  * Tools whose description carries protocol the model must not lose mid-run
  * (delegation rules, background-subagent etiquette, edit contracts). Everything
  * else is compacted to its first sentence — but for the WHOLE run, so the tool
@@ -215,8 +207,9 @@ function coalesceEmit(raw: (e: AgentEvent) => void): (e: AgentEvent) => void {
 
 export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	const { apiBaseUrl, apiKey, model, prompt, attachments, history: persistedHistory, maxTokens, maxSteps, autoContinue, contextTokens, sampling, modelParams, anthropic, oauthKind, systemPromptOverride, extraInstructions, enableFileReading, enableTerminalSuggestions, enableWorkspaceContext, approve, isSubagent, customSubagents, teams, activeTeamIds, subagentModel, availableModels, registerSubagentAbort, askUser, onAfterRun, onBeforeShell, onAfterEdit, onHook, signal, emit: rawEmit } = opts;
-	// Model history is disposable and may be compacted/pruned. Persisted history
-	// remains lossless for chat display/export, including full tool output/thinking.
+	// Model history is disposable and may be compacted when the window fills.
+	// Persisted history remains lossless for chat display/export, including full
+	// tool output/thinking.
 	const history: Step[] = persistedHistory.map((s) => structuredClone(s));
 	const pushHistory = (...steps: Step[]) => {
 		history.push(...steps);
@@ -488,7 +481,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	};
 	const toolTokenCache = new Map<Mode, number>();
 
-	/** Durable, prune-proof record of everything this run did. */
+	/** Durable run record of everything this run did. */
 	const ledger = new ActivityLedger();
 	/** Step index of the last compaction, for the cooldown. */
 	let lastCompactionStep = -Infinity;
@@ -660,16 +653,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			// Tool schemas ride along on every request and are large; leaving them
 			// out of the estimate made the guard optimistic by 10k+ tokens.
 			const overheadTokens = Math.ceil(system.length / 4) + toolSchemaTokens();
-			// 0) Cheap in-place economy: stub stale tool dumps + slim old edit args.
-			// Free (no LLM call) but it rewrites already-sent messages, which costs a
-			// prompt-cache miss — so only start once the window is actually filling up.
-			// Recent work always stays verbatim, and the durable ledger keeps the rest.
-			const keepRecentTokens = budget > 0 ? Math.max(4_000, Math.floor(budget * 0.25)) : 12_000;
-			const rawFill = stepsTokens(history) + overheadTokens;
-			if (budget <= 0 || rawFill >= budget * ECONOMIZE_AT_FILL) {
-				economizeHistory(history, { keepRecentTokens });
-			}
-			// 1) Auto-summarization: soft boundary from 65% fill; hard at 78%.
+			// Strip UI-only thinking; tool bodies and edit args stay verbatim.
+			economizeHistory(history);
+			// Auto-summarization only when the window is nearly full (soft/hard fills).
 			const usedEst = stepsTokens(history) + overheadTokens;
 			const fill = Math.max(usedEst, lastPrompt);
 			const cooledDown = step - lastCompactionStep >= COMPACT_COOLDOWN_STEPS;
@@ -697,8 +683,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 							...tail,
 						);
 						lastCompactionStep = step;
-						// Re-economize the new tail (summary is dense; keep it).
-						economizeHistory(history, { keepRecentTokens });
+						economizeHistory(history);
 						emit({ type: "compaction", status: "done", summary });
 					} catch {
 						emit({ type: "compaction", status: "failed" });
@@ -721,8 +706,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				} catch { /* context is best-effort */ }
 			}
 			// Durable run record: what happened and how each card ended, never file
-			// bodies. Rebuilt every step from state that pruning cannot touch, so the
-			// agent keeps its memory of the run at a flat token cost.
+			// bodies. Rebuilt every step so the agent keeps a flat-cost run memory
+			// even after auto-summarization.
 			const taskState = ledger.isEmpty
 				? undefined
 				: ledger.render({ request: currentRequestText(history), todos: toolCtx.todos });
@@ -1181,10 +1166,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				if (call.name === "WritePlan" && r.status === "completed") {
 					planWritten = true;
 				}
-				// Record the card's outcome in the durable ledger before the result can
-				// ever be pruned out of history.
+				// Durable ledger backs the flat-cost <task_state> block; history itself
+				// keeps full tool results until auto-summarize / budget trim.
 				ledger.record(call.name, parsed[i].input, r.status, r.output);
-				// Recent results stay full; economizeHistory stubs older dumps only.
 				pushHistory({ kind: "tool-result", callId: call.id, name: call.name, output: r.output, status: r.status, image: r.image });
 			}
 			// After launching background Task(s), wait for that wave before calling the

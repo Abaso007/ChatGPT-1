@@ -71,15 +71,23 @@ async function restoreInlineDiffSetting() {
   previousValues.clear();
 }
 
-/** Open (or refresh) the inline diff for a tracked change. */
+/** Push the latest "before" text into an already-open diff without touching tabs. */
+function refreshOriginal(relPath: string) {
+  const change = pendingChanges.get(relPath);
+  if (!change) return;
+  const before = beforeUriFor(relPath);
+  ORIGINALS.set(before.path.replace(/^\//, ""), change.before);
+  originalsChanged.fire(before);
+}
+
+/** Open the inline diff for a tracked change. Only ever called from an explicit user action. */
 async function showInlineDiff(relPath: string, preserveFocus = true) {
   const change = pendingChanges.get(relPath);
   if (!change) return;
   const fileUri = fileUriFor(relPath);
   if (!fileUri) return;
   const before = beforeUriFor(relPath);
-  ORIGINALS.set(before.path.replace(/^\//, ""), change.before);
-  originalsChanged.fire(before);
+  refreshOriginal(relPath);
   await applyInlineDiffSetting();
   await vscode.commands.executeCommand(
     "vscode.diff",
@@ -153,7 +161,11 @@ let refreshTimer: NodeJS.Timeout | undefined;
 /** Paths we currently have an inline-diff tab open for. */
 const openDiffs = new Set<string>();
 
-/** Diffs are only opened on request; this keeps already-open ones in sync. */
+/**
+ * Never opens or focuses anything. Agent edits only refresh the content of
+ * diffs the user opened themselves, close ones whose change is gone, and
+ * repaint changed-line highlights in already-visible editors.
+ */
 async function sync() {
   const live = new Set(pendingChanges.list().map((c) => c.path));
 
@@ -162,8 +174,9 @@ async function sync() {
       openDiffs.delete(path);
       await closeInlineDiff(path);
     } else {
-      // The "before" side must be refreshed when the agent edits the file again.
-      await showInlineDiff(path, true);
+      // Update the virtual "before" document in place — no vscode.diff call,
+      // so an edit can never pull the editor onto a diff tab.
+      refreshOriginal(path);
     }
   }
   if (!live.size) await restoreInlineDiffSetting();

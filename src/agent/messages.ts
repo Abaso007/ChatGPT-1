@@ -20,9 +20,10 @@ const EPHEMERAL: CacheControl = { type: "ephemeral" };
  * long runs "forget" the task) and the live user turn.
  *
  * Everything else is selected newest-first in whole call groups, durable state
- * before raw context, after dump bodies and edit payloads have been hard-slimmed.
- * A group is an assistant's tool_calls plus the results that answer them, so a
- * trim can never orphan a call and produce an invalid request.
+ * before raw context. Tool bodies stay full — when the window is over budget
+ * we drop whole groups, never stub their content. A group is an assistant's
+ * tool_calls plus the results that answer them, so a trim can never orphan a
+ * call and produce an invalid request.
  *
  * `overheadTokens` must cover everything that rides along outside the steps —
  * system prompt *and* tool schemas. Counting only the system prompt made this
@@ -32,8 +33,7 @@ export function fitStepsToBudget(steps: Step[], overheadTokens: number, budgetTo
   const budget = budgetTokens - overheadTokens;
   if (budget <= 0) return steps;
 
-  // Clone + hard-slim dumps so we do not mutate the live history further, and
-  // so bulk file bodies no longer force dropping of durable task state.
+  // Clone so we do not mutate the live history; strip UI-only thinking only.
   const work = steps.map((s) => structuredClone(s));
   economizeHistoryHard(work);
 
