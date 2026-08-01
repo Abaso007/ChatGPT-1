@@ -4,6 +4,15 @@ All notable changes to the "ocursor" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.1.2] - 2026-08-01
+
+### Changed
+
+- Context pruning removed: tool results and edit args stay verbatim for the full run (thinking still stripped as UI-only)
+- Auto-compaction deferred until ~85–92% fill, keeps a larger verbatim tail (~55%), and cools down longer between summaries
+- `fitStepsToBudget` drops whole call groups when over budget instead of stubbing dump bodies
+- Agent edits never open or focus an editor: diffs open only from an explicit click in the review bar or on an edit card; already-open diffs refresh in place
+
 ## [0.1.1] - 2026-07-30
 
 ### Added
